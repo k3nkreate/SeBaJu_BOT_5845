@@ -1,0 +1,300 @@
+<mujoco model="SeBaJu_Bot">
+
+    <!--=======================================================================
+    SeBaJu Bot — Ascento-conformant two-wheeled balancing robot
+    =========================================================================
+
+    COORDINATE CONVENTION  (axis="0 1 0", right-hand rule around +Y)
+    ─────────────────────────────────────────────────────────────────
+    Thumb points in +Y (robot's left).  Fingers curl +Z → +X.
+    Positive angle = component tips FORWARD (+X direction).
+
+    To achieve a DEEPER crouched posture (lower CoM, better stability):
+      • Hip ref = −0.785 rad (−45°) → thigh tips further BACKWARD (−X)
+      • Knee ref = +1.571 rad (+90°) → shank bends forward relative to thigh
+        → absolute shank angle = −0.785 + 1.571 = +0.786 rad from vertical
+        → X offsets cancel: wheel directly under CoM ✓
+
+    WHEEL-UNDER-CoM CONSTRAINT (must always hold):
+      For X offsets to cancel:  sin(hip_ref) + sin(hip_ref + knee_ref) = 0
+      → knee_ref = −2 × hip_ref
+      → hip_ref = −0.785 rad gives knee_ref = +1.571 rad (= pi/2, anatomical limit)
+      This is the MAXIMUM feasible crouch within joint limits.
+
+    GEOMETRY (verified):
+      thigh = shank = 0.22 m,  wheel radius = 0.06 m
+      Thigh vector:  (sin(-0.785)x0.22, 0, -cos(0.785)x0.22) = (-0.1556, 0, -0.1556) m
+      Shank vector:  (sin(+0.786)x0.22, 0, -cos(0.786)x0.22) = (+0.1557, 0, -0.1555) m
+      Wheel X offset from hip: -0.1556 + 0.1557 = 0.000 m (under CoM)
+      Leg height:   0.1556 + 0.1555 = 0.3111 m
+      Base height:  0.3111 + 0.060  = 0.3711 m  keyframe z = 0.371
+
+    STABILITY BENEFIT:
+      Toppling torque = m*g*h_CoM*sin(theta)
+      Old h_CoM = 0.423 m, new h_CoM = 0.371 m: 12.3% reduction in torque per degree of tilt.
+
+    CoM LOWERED (further):
+      inertial pos="0 0 0.00" stays — local frame, base body shifts in world.
+      IMU site lowered to pos="0 0 0.07" (top of 7cm half-length cylinder)
+
+    ASCENTO ALIGNMENT
+    ─────────────────
+    • Body is the combined torso — no separate torso_pitch joint.
+      Ascento's stabilising controller acts directly on the inverted-pendulum
+      body (the main chassis) via the wheel motors.  There is no inner joint
+      to keep level.
+    • Hip motors hold leg geometry; wheel motors provide balance torque.
+    • Torsion springs at knee replicated by joint stiffness.
+
+    ACTUATOR ctrl[] MAP
+    ───────────────────
+      [0] left_hip_motor
+      [1] right_hip_motor
+      [2] left_knee_motor
+      [3] right_knee_motor
+      [4] left_wheel_motor
+      [5] right_wheel_motor
+
+    SENSOR sensordata[] MAP
+    ───────────────────────
+      [0..3]  quaternion (w,x,y,z) — imu_site orientation in world frame
+      [4..6]  gyro (rad/s) — roll, PITCH, yaw  ← [5] is dθ/dt
+      [7..9]  accelerometer (m/s²) — x, y, z
+      [10]    left  wheel joint angle  (rad)
+      [11]    left  wheel joint velocity (rad/s)
+      [12]    right wheel joint angle  (rad)
+      [13]    right wheel joint velocity (rad/s)
+    =======================================================================-->
+
+    <option timestep="0.002" gravity="0 0 -9.81" integrator="RK4"/>
+    <compiler angle="radian"/>
+
+    <default>
+        <joint damping="0.5" armature="0.01" stiffness="0" frictionloss="0.01"/>
+        <geom friction="1 0.05 0.01"/>
+    </default>
+
+    <!--=======================================================================
+    KEYFRAME
+    ─────────────────────────────────────────────────────────────────────────
+    qpos order (XML top-down traversal):
+      [0..2]   base x, y, z
+      [3..6]   base quaternion  (w x y z)  — identity = upright
+      [7]      left_hip   = 0   (actual = 0 + ref(−0.60) = −0.60 rad)
+      [8]      left_knee  = 0   (actual = 0 + ref(−1.20) = −1.20 rad)
+      [9]      left_wheel = 0
+      [10]     right_hip  = 0
+      [11]     right_knee = 0
+      [12]     right_wheel= 0
+    =======================================================================-->
+    <keyframe>
+        <key name="stand" qpos="0 0 0.371  1 0 0 0  0 0 0  0 0 0"/>
+    </keyframe>
+
+    <asset>
+        <material name="torso_mat" rgba="0.2 0.6 0.8 1"/>
+        <material name="thigh_mat" rgba="0.86 0.78 0.74 1"/>
+        <material name="shank_mat" rgba="0.55 0.33 0.14 1"/>
+        <material name="wheel_mat" rgba="0.05 0.05 0.05 1"/>
+    </asset>
+
+    <worldbody>
+        <light pos="0 0 4" dir="0 0 -1" diffuse="0.9 0.9 0.9"/>
+
+        <geom name="ground" type="plane" size="10 10 0.1"
+              contype="1" conaffinity="1"
+              rgba="0.35 0.45 0.35 1" friction="1.0 0.05 0.01"/>
+
+        <!--===================================================================
+        BASE BODY — free-floating anchor (no torso_pitch joint)
+        ─────────────────────────────────────────────────────────────────────
+        The entire chassis is one rigid body, just like Ascento's pendulum
+        body.  The free joint gives 6-DOF motion in the world.
+        mass=2.5 kg represents the combined chassis + electronics.
+        pos="0 0 0.371" matches keyframe height.
+        ===================================================================-->
+        <body name="base" pos="0 0 0.371">
+            <joint name="root" type="free"/>
+            <!-- CoM lowered: from z=0.06 to z=0.00 (base pivot level).
+                 Torso geom and IMU site shifted down commensurately. -->
+            <inertial pos="0 0 0.00" mass="2.5" diaginertia="0.02 0.02 0.01"/>
+
+            <!-- Torso cylinder — axis along Y, radius 10 cm, half-length 7 cm 
+            Shifted down 0.06 m: was pos="0 0 0.06", now pos="0 0 0.00"
+            Strickly testing: collusion >> contype="0" conaffinity="0" in Torso, right and left thigh and knee-->
+            <geom type="cylinder" size="0.10 0.07"
+                  pos="0.0 0 0.00"
+                  quat="0.7071 0.7071 0 0"
+                  material="torso_mat"
+                  contype="1" conaffinity="1"/>
+
+            <!-- IMU site at top of torso 
+            at top of torso cylinder (half-length 0.07 m above pivot)-->
+            <site name="imu_site" pos="0.0 0 0.07" size="0.01" rgba="1 1 0 1"/>
+
+            <!--===============================================================
+            LEFT LEG
+            ─────────────────────────────────────────────────────────────────
+            axis="0 1 0" + ref=−0.60 → at rest, thigh tips 34° backward (−X).
+            axis="0 1 0" + ref=−1.20 → at rest, shank sweeps 69° forward-down.
+            thigh → absolute shank angle = +0.60 rad from vertical.
+              Wheel X-offset cancels thigh X-offset → wheel under CoM. ✓
+
+            Knee range "0.10 1.571":
+              +0.10 rad =  +5.7° min bend  (prevents singular full extension)
+              +1.571 rad = +90°  max bend  (hard anatomical limit)
+              ref=+1.20 sits comfortably inside range.
+
+            Thigh & shank geom quat="1 0 0 0" (identity): capsule long-axis
+              is local Z, pointing down (pos="0 0 -0.11" offsets centre).
+              The previous quat="0 1 0 0" (180° about X) was redundant —
+              flipping Z→−Z then offsetting −Z gave the same world position
+              but introduced a spurious 180° body rotation that confused the
+              joint-frame interpretation.
+
+            stiffness=50 on knee: passive spring resisting straightening past
+            ref=+1.20.  Mirrors Ascento's torsion springs at inner joints.
+            ===============================================================-->
+            <body name="left_leg" pos="0 0.09 0">
+                <!--Changed ref to -ve to align with -X axis coordinate
+                expanded range as ref=-0.60 increased to -0.785 ("-0.96 0.96 >> -1.20 0.40")-->
+                <joint name="left_hip" type="hinge"
+                       axis="0 1 0"
+                       range="-1.20 0.40"
+                       ref="-0.785"
+                       damping="1.5"/>
+                  <!--changed quat to 1 0 0 0 ~ no rotation; ref provides required orientation-->
+                <geom name="left_thigh" type="capsule"
+                      pos="0 0 -0.11"
+                      size="0.022 0.11"
+                      quat="1 0 0 0"
+                      material="thigh_mat"
+                      mass="0.20" contype="1" conaffinity="1"/>
+
+                <body name="left_shank" pos="0 0 -0.22">
+                      <!--changed to +ve with respect to -ve parent body thigh ref, ensuring shank bends forward
+                      and maintains wheel-under-CoM constraint.
+                      Expanded range as ref=1.20 increased to 1.571 ("0.10 1.571 >> 0.20 1.571")
+                      Strickly testing: Knee range moved 0.20 1.571 >> 0.20 1.80, Stiffness 50 >> 10-->
+                    <joint name="left_knee" type="hinge"
+                           axis="0 1 0"
+                           range="0.20 1.80"
+                           ref="1.571"
+                           stiffness="10" damping="1.0"/>
+                      <!--changed quat to 1 0 0 0 ~ no rotation; ref provides required orientation-->
+                    <geom name="left_shank_geom" type="capsule"
+                          pos="0 0 -0.11"
+                          size="0.020 0.11"
+                          quat="1 0 0 0"
+                          material="shank_mat"
+                          mass="0.15" contype="1" conaffinity="1"/>
+
+                    <body name="left_wheel_body" pos="0 0.025 -0.22">
+                        <joint name="left_wheel_joint" type="hinge"
+                               axis="0 1 0" damping="0.05" armature="0.05"/>
+
+                        <geom type="cylinder" size="0.06 0.025"
+                              quat="0.7071 0.7071 0 0"
+                              material="wheel_mat"
+                              mass="0.3" contype="1" conaffinity="1"
+                              friction="1.5 0.05 0.01" pos="0 0.012 0"/>
+                    </body>
+                </body>
+            </body>
+
+            <!--===============================================================
+            RIGHT LEG — mirror of left leg, offset −0.09 m in Y
+            ===============================================================-->
+            <body name="right_leg" pos="0 -0.09 0">
+
+                <joint name="right_hip" type="hinge"
+                       axis="0 1 0"
+                       range="-1.20 0.40"
+                       ref="-0.785"
+                       damping="1.5"/>
+
+                <geom name="right_thigh" type="capsule"
+                      pos="0 0 -0.11"
+                      size="0.022 0.11"
+                      quat="1 0 0 0"
+                      material="thigh_mat"
+                      mass="0.20" contype="1" conaffinity="1"/>
+
+                <body name="right_shank" pos="0 0 -0.22">
+
+                    <joint name="right_knee" type="hinge"
+                           axis="0 1 0"
+                           range="0.20 1.80"
+                           ref="1.571"
+                           stiffness="10" damping="1.0"/>
+
+                    <geom name="right_shank_geom" type="capsule"
+                          pos="0 0 -0.11"
+                          size="0.020 0.11"
+                          quat="1 0 0 0"
+                          material="shank_mat"
+                          mass="0.15" contype="1" conaffinity="1"/>
+
+                    <body name="right_wheel_body" pos="0 -0.025 -0.22">
+                        <joint name="right_wheel_joint" type="hinge"
+                               axis="0 1 0" damping="0.05" armature="0.05"/>
+
+                        <geom type="cylinder" size="0.06 0.025"
+                              quat="0.7071 0.7071 0 0"
+                              material="wheel_mat"
+                              mass="0.3" contype="1" conaffinity="1"
+                              friction="1.5 0.05 0.01" pos="0 -0.012 0"/>
+                    </body>
+                </body>
+            </body>
+
+        </body><!-- end base -->
+    </worldbody>
+
+    <!--=======================================================================
+    ACTUATORS
+    ─────────────────────────────────────────────────────────────────────────
+    ctrl[] INDEX MAP  (order = exact order listed here):
+      [0] left_hip_motor
+      [1] right_hip_motor
+      [2] left_knee_motor
+      [3] right_knee_motor
+      [4] left_wheel_motor
+      [5] right_wheel_motor
+
+    Gear values mirror Ascento's torque budget:
+      Wheel motors : gear=30 → max 30 Nm  (balance actuators)
+      Hip/knee     : gear=50 → max 50 Nm  (posture actuators)
+    =======================================================================-->
+    <actuator>
+        <motor name="left_hip_motor"    joint="left_hip"          gear="50" ctrlrange="-1 1"/>
+        <motor name="right_hip_motor"   joint="right_hip"         gear="50" ctrlrange="-1 1"/>
+        <motor name="left_knee_motor"   joint="left_knee"         gear="50" ctrlrange="-1 1"/>
+        <motor name="right_knee_motor"  joint="right_knee"        gear="50" ctrlrange="-1 1"/>
+        <motor name="left_wheel_motor"  joint="left_wheel_joint"  gear="30" ctrlrange="-1 1"/>
+        <motor name="right_wheel_motor" joint="right_wheel_joint" gear="30" ctrlrange="-1 1"/>
+    </actuator>
+
+    <!--=======================================================================
+    SENSORS
+    ─────────────────────────────────────────────────────────────────────────
+    sensordata[] INDEX MAP:
+      [0..3]  framequat  — imu_site orientation (w, x, y, z)
+      [4..6]  gyro       — (roll_rate, PITCH_rate, yaw_rate) rad/s
+      [7..9]  accel      — (ax, ay, az) m/s²
+      [10]    left  wheel angle    (rad)
+      [11]    left  wheel velocity (rad/s)
+      [12]    right wheel angle    (rad)
+      [13]    right wheel velocity (rad/s)
+    =======================================================================-->
+    <sensor>
+        <framequat     name="imu_orientation"     objtype="site" objname="imu_site"/>
+        <gyro          name="imu_gyro"             site="imu_site"/>
+        <accelerometer name="imu_accel"            site="imu_site"/>
+        <jointpos      name="left_wheel_encoder"   joint="left_wheel_joint"/>
+        <jointvel      name="left_wheel_velocity"  joint="left_wheel_joint"/>
+        <jointpos      name="right_wheel_encoder"  joint="right_wheel_joint"/>
+        <jointvel      name="right_wheel_velocity" joint="right_wheel_joint"/>
+    </sensor>
+
+</mujoco>
