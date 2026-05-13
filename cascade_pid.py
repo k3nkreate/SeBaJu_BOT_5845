@@ -62,22 +62,22 @@ def clamp(value, lo, hi):
     return float(np.clip(value, lo, hi))
 
 
-class KeyboardController:
-    V_CMD     = 0.3
-    TURN_RATE = 0.15
+#class KeyboardController:
+    #V_CMD     = 0.3
+    #TURN_RATE = 0.15
 
-    def __init__(self):
-        self.v_ref = 0.0
-        self.turn  = 0.0
+    #def __init__(self):
+        #self.v_ref = 0.0
+        #self.turn  = 0.0
 
-    def update(self, viewer):
-        ks = getattr(viewer, 'key_state', {})
-        if   ks.get('W', False) or ks.get('w', False): self.v_ref = +self.V_CMD
-        elif ks.get('S', False) or ks.get('s', False): self.v_ref = -self.V_CMD
-        else:                                           self.v_ref =  0.0
-        if   ks.get('A', False) or ks.get('a', False): self.turn  = +self.TURN_RATE
-        elif ks.get('D', False) or ks.get('d', False): self.turn  = -self.TURN_RATE
-        else:                                           self.turn  =  0.0
+    #def update(self, viewer):
+        #ks = getattr(viewer, 'key_state', {})
+        #if   ks.get('W', False) or ks.get('w', False): self.v_ref = +self.V_CMD
+        #elif ks.get('S', False) or ks.get('s', False): self.v_ref = -self.V_CMD
+        #else:                                           self.v_ref =  0.0
+        #if   ks.get('A', False) or ks.get('a', False): self.turn  = +self.TURN_RATE
+        #elif ks.get('D', False) or ks.get('d', False): self.turn  = -self.TURN_RATE
+        #else:                                           self.turn  =  0.0
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -108,13 +108,13 @@ def run():
     outer_integral = 0.0
     inner_integral = 0.0
     step           = 0
-    keyboard       = KeyboardController()
+    #keyboard       = KeyboardController()
 
     print(f"\nCASCADE PID (FIXED v2):")
     print(f"  Outer: Kp={OUTER_KP}, Ki={OUTER_KI}  (velocity → pitch target)")
     print(f"  Inner: Kp={INNER_KP}, Kd={INNER_KD}, Ki={INNER_KI}  (pitch → wheel torque)")
     print(f"  PITCH_OFFSET = {PITCH_OFFSET:.4f} rad ({math.degrees(PITCH_OFFSET):.2f}°)")
-    print(f"\nControls: W=Forward  S=Backward  A=TurnLeft  D=TurnRight")
+    #print(f"\nControls: W=Forward  S=Backward  A=TurnLeft  D=TurnRight")
     print("─" * 80)
     print(f"{'Time':>6}  {'Pitch':>9}  {'Rate':>9}  {'Vel':>11}  {'PitchTgt':>9}  {'WheelU':>7}  {'Status'}")
     print("─" * 80)
@@ -135,9 +135,9 @@ def run():
             omega_R    = float(sd[13])
             velocity   = (omega_L + omega_R) / 2.0 * 0.06  # m/s, positive=forward
 
-            keyboard.update(viewer)
-            active_v_ref = V_REF + keyboard.v_ref
-            active_turn  = keyboard.turn
+            #keyboard.update(viewer)
+            active_v_ref = V_REF #V_REF + keyboard.v_ref
+            active_turn  = 0.0 #keyboard.turn
 
             # ══════════════════════════════════════════════════════════
             # OUTER LOOP — velocity → pitch target
