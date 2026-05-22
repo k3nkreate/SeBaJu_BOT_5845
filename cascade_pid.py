@@ -18,13 +18,13 @@ import os
 import numpy as np
 
 XML_FILE    = "SeBaJu_BOT.xml"
-SLOW_FACTOR = 0.5   # 0.5 = half speed for easier observation
+SLOW_FACTOR = 0.5   # 0.5 = half speed for easier observation, 1.0 = real-time, 2.0 = double speed, etc.
 
 # ══════════════════════════════════════════════════════════════════
 # OUTER LOOP — VELOCITY CONTROLLER
 # Converts velocity error → desired pitch correction
 # ══════════════════════════════════════════════════════════════════
-V_REF                = 0.0    # m/s — target velocity (0 = stationary)
+V_REF                = 0.0    # m/s — target velocity (0 = stationary), increase or decrease to test forward or backward movement
 OUTER_KP             = 0.08   # rad lean per m/s error  [was 0.04 — doubled]
 OUTER_KI             = 0.003 #0.005 #0.001  # slow integral for persistent drift [was 0.002]
 OUTER_MAX_INTEGRAL   = 0.05
@@ -62,24 +62,6 @@ def clamp(value, lo, hi):
     return float(np.clip(value, lo, hi))
 
 
-#class KeyboardController:
-    #V_CMD     = 0.3
-    #TURN_RATE = 0.15
-
-    #def __init__(self):
-        #self.v_ref = 0.0
-        #self.turn  = 0.0
-
-    #def update(self, viewer):
-        #ks = getattr(viewer, 'key_state', {})
-        #if   ks.get('W', False) or ks.get('w', False): self.v_ref = +self.V_CMD
-        #elif ks.get('S', False) or ks.get('s', False): self.v_ref = -self.V_CMD
-        #else:                                           self.v_ref =  0.0
-        #if   ks.get('A', False) or ks.get('a', False): self.turn  = +self.TURN_RATE
-        #elif ks.get('D', False) or ks.get('d', False): self.turn  = -self.TURN_RATE
-        #else:                                           self.turn  =  0.0
-
-
 # ══════════════════════════════════════════════════════════════════
 # MAIN LOOP
 # ══════════════════════════════════════════════════════════════════
@@ -108,13 +90,12 @@ def run():
     outer_integral = 0.0
     inner_integral = 0.0
     step           = 0
-    #keyboard       = KeyboardController()
+    
 
     print(f"\nCASCADE PID (FIXED v2):")
     print(f"  Outer: Kp={OUTER_KP}, Ki={OUTER_KI}  (velocity → pitch target)")
     print(f"  Inner: Kp={INNER_KP}, Kd={INNER_KD}, Ki={INNER_KI}  (pitch → wheel torque)")
     print(f"  PITCH_OFFSET = {PITCH_OFFSET:.4f} rad ({math.degrees(PITCH_OFFSET):.2f}°)")
-    #print(f"\nControls: W=Forward  S=Backward  A=TurnLeft  D=TurnRight")
     print("─" * 80)
     print(f"{'Time':>6}  {'Pitch':>9}  {'Rate':>9}  {'Vel':>11}  {'PitchTgt':>9}  {'WheelU':>7}  {'Status'}")
     print("─" * 80)
@@ -135,12 +116,13 @@ def run():
             omega_R    = float(sd[13])
             velocity   = (omega_L + omega_R) / 2.0 * 0.06  # m/s, positive=forward
 
-            #keyboard.update(viewer)
-            active_v_ref = V_REF #V_REF + keyboard.v_ref
-            active_turn  = 0.0 #keyboard.turn
+            #keyboard.update(viewer) - This has been removed
+            active_v_ref = V_REF 
+            active_turn  = 0.0 
+
 
             # ══════════════════════════════════════════════════════════
-            # OUTER LOOP — velocity → pitch target
+            # OUTER LOOP — velocity error → pitch target
             # ══════════════════════════════════════════════════════════
             vel_error = active_v_ref - velocity
             # vel_error < 0 means moving backward faster than desired
@@ -157,6 +139,7 @@ def run():
             )
 
             pitch_target = PITCH_OFFSET + pitch_correction
+
 
             # ══════════════════════════════════════════════════════════
             # INNER LOOP — pitch error → wheel torque
