@@ -1,12 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║  SeBaJu — CASCADE PID  (FIXED v2)                              ║
-║  Key fixes vs previous version:                                  ║
-║    1. INNER_KI reduced from 0.02 → 0.005  (was winding up)     ║
-║    2. OUTER_KP increased from 0.04 → 0.08  (was too weak)      ║
-║    3. OUTER_KI reduced from 0.002 → 0.001  (slow and safe)     ║
-║    4. MAX_PITCH_CORRECTION reduced 0.15 → 0.10  (safer limit)  ║
-║    5. PITCH_OFFSET tuned to -0.035 (slightly less backward)     ║
+║  SeBaJu — CASCADE PID  
+║  Author: Kennedy CHUKWUMA
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -20,15 +15,24 @@ import numpy as np
 XML_FILE    = "SeBaJu_BOT.xml"
 SLOW_FACTOR = 0.5   # 0.5 = half speed for easier observation, 1.0 = real-time, 2.0 = double speed, etc.
 
+
+#=═════════════════════════════════════════════════════════════════
+# MOVEMENT PROFILE CONFIGURATION
+#=═════════════════════════════════════════════════════════════════
+X_TARGET_FINAL = 0.50    # m — target position to reach
+MOVE_VELOCITY   = 0.10  # m/s — how fast to move forward (positive) or backward (negative)
+x_target = 0.0  # Desired position (m) — we want to stay at x=0 until we decide to move
+
+
 # ══════════════════════════════════════════════════════════════════
 # OUTER LOOP — VELOCITY CONTROLLER
 # Converts velocity error → desired pitch correction
 # ══════════════════════════════════════════════════════════════════
 V_REF                = 0.0    # m/s — target velocity (0 = stationary), increase or decrease to test forward or backward movement
-OUTER_KP             = 0.08   # rad lean per m/s error  [was 0.04 — doubled]
-OUTER_KI             = 0.003 #0.005 #0.001  # slow integral for persistent drift [was 0.002]
-OUTER_MAX_INTEGRAL   = 0.05
-MAX_PITCH_CORRECTION = 0.10   # rad — max lean outer loop can command [was 0.15]
+OUTER_KP             = 0.03 #0.03   # rad lean per m/s error  [was 0.04 — doubled]
+OUTER_KD             = 0.07 #0.07   # slow integral for persistent drift [was 0.002]
+#OUTER_MAX_INTEGRAL   = 0.05
+MAX_PITCH_CORRECTION = 0.07 #0.10   # rad — max lean outer loop can command [was 0.15]
 
 # ══════════════════════════════════════════════════════════════════
 # INNER LOOP — BALANCE CONTROLLER
@@ -74,30 +78,42 @@ def run():
     print(f"\nLoading: {xml_path}")
     model = mujoco.MjModel.from_xml_path(xml_path)
     data  = mujoco.MjData(model)
+    
 
     kid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "stand")
     if kid >= 0:
         mujoco.mj_resetDataKeyframe(model, data, kid)
         print("Keyframe 'stand' applied.")
 
+
+    # Root joint is free-floating base, not actuated. We read its position to track the robot's position.
+    root_id   = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "root")
+    root_qadr = model.jnt_qposadr[root_id]
+
+
     jnames = ["left_hip","right_hip","left_knee","right_knee",
               "left_wheel_joint","right_wheel_joint"]
     jid  = {n: mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, n) for n in jnames}
     qadr = {n: model.jnt_qposadr[jid[n]] for n in jnames}
     vadr = {n: model.jnt_dofadr [jid[n]] for n in jnames}
-
+    
+    #===================================================
+    # Initialising key parameters for the control loops
+    #===================================================
     dt             = model.opt.timestep
-    outer_integral = 0.0
+    #outer_integral = 0.0
     inner_integral = 0.0
     step           = 0
+    x_target = 0.0  # Desired position (m) — we want to stay at x=0
+    pitch_target = 0.0  # Initial target pitch (rad) — will be updated by outer loop
     
 
     print(f"\nCASCADE PID (FIXED v2):")
-    print(f"  Outer: Kp={OUTER_KP}, Ki={OUTER_KI}  (velocity → pitch target)")
+    print(f"  Outer: Kp={OUTER_KP}, Kd={OUTER_KD}  (position + velocity → pitch target)")
     print(f"  Inner: Kp={INNER_KP}, Kd={INNER_KD}, Ki={INNER_KI}  (pitch → wheel torque)")
     print(f"  PITCH_OFFSET = {PITCH_OFFSET:.4f} rad ({math.degrees(PITCH_OFFSET):.2f}°)")
     print("─" * 80)
-    print(f"{'Time':>6}  {'Pitch':>9}  {'Rate':>9}  {'Vel':>11}  {'PitchTgt':>9}  {'WheelU':>7}  {'Status'}")
+    print(f"{'Time':>6}  {'Pitch':>9}  {'Rate':>9}  {'Vel':>11}  {'PitchTgt':>11}  {'WheelU':>9}  {'XCurrent':>10}  {'Status'}")
     print("─" * 80)
 
     with mujoco.viewer.launch_passive(model, data) as viewer:
@@ -118,27 +134,63 @@ def run():
 
             #keyboard.update(viewer) - This has been removed
             active_v_ref = V_REF 
-            active_turn  = 0.0 
+            active_turn  = 0.00 
+            #x_target = 0.0  # Desired position (m) — we want to stay at x=0
+            x_current = float(data.qpos[root_qadr])  # Current x position of the robot's base
 
-
+            #=═════════════════════════════════════════════════════════════════
+            # MOVEMENT PROFILE CONFIGURATION IMPLEMENTATION
+            #=═════════════════════════════════════════════════════════════════
+            # Slowly advance x_target toward X_TARGET_FINAL at the specified MOVE_VELOCITY
+            if abs(x_target - X_TARGET_FINAL) > 0.001: # Yet to arrive at target
+                step_size = MOVE_VELOCITY * dt         # How much to move x_target this timestep
+                if X_TARGET_FINAL > x_target:
+                    x_target = min(x_target + step_size, X_TARGET_FINAL)  # Move but don't overshoot
+                else:
+                    x_target = max(x_target - step_size, X_TARGET_FINAL)  # Move but don't overshoot
+                    #Once x_target reaches X_TARGET_FINAL, it will stay there and we can observe how the robot maintains balance at the new position.
+            
+            
             # ══════════════════════════════════════════════════════════
-            # OUTER LOOP — velocity error → pitch target
+            # OUTER LOOP — position + velocity error → pitch target
+            # Changed Outer PI to PD
             # ══════════════════════════════════════════════════════════
             vel_error = active_v_ref - velocity
             # vel_error < 0 means moving backward faster than desired
             # → pitch_correction negative → lean forward → wheels brake backward drift
 
-            outer_integral = clamp(
-                outer_integral + vel_error * dt,
-                -OUTER_MAX_INTEGRAL, OUTER_MAX_INTEGRAL
-            )
+            pos_error = x_target - x_current
+
+            #outer_integral = clamp(
+            #    outer_integral + vel_error * dt,
+            #    -OUTER_MAX_INTEGRAL, OUTER_MAX_INTEGRAL
+            #)
+
+            #pitch_correction = clamp(
+            #    OUTER_KP * vel_error + OUTER_KI * outer_integral,
+            #    -MAX_PITCH_CORRECTION, MAX_PITCH_CORRECTION
+            #)
 
             pitch_correction = clamp(
-                OUTER_KP * vel_error + OUTER_KI * outer_integral,
+                OUTER_KP * pos_error + OUTER_KD * vel_error,
                 -MAX_PITCH_CORRECTION, MAX_PITCH_CORRECTION
             )
+            #=═════════════════════════════════════════════════════════
+            # pitch_target = PITCH_OFFSET + pitch_correction
+            # Adding a rate limiter to the pitch_target to prevent sudden large changes that could destabilize the robot
+            #=═════════════════════════════════════════════════════════
+            
+            raw_target = PITCH_OFFSET + pitch_correction
 
-            pitch_target = PITCH_OFFSET + pitch_correction
+            # rate limiter - pitch_target can only change by a certain amount per timestep = 0.002s (0.5 deg)
+            MAX_TARGET_RATE = math.radians(0.5)  # max change in target pitch per second
+            if raw_target > pitch_target + MAX_TARGET_RATE:
+                pitch_target = pitch_target + MAX_TARGET_RATE
+            elif raw_target < pitch_target - MAX_TARGET_RATE:
+                pitch_target = pitch_target - MAX_TARGET_RATE
+            else:
+                pitch_target = raw_target
+
 
 
             # ══════════════════════════════════════════════════════════
@@ -199,6 +251,7 @@ def run():
                     f"vel={velocity:+7.3f}m/s  "
                     f"tgt={math.degrees(pitch_target):+6.2f}°  "
                     f"{wheel_u:+6.3f}  "
+                    f"x={x_current:+6.3f}m  "
                     f"{status}"
                 )
 
