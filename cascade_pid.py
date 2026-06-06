@@ -15,14 +15,25 @@ import numpy as np
 XML_FILE    = "SeBaJu_BOT.xml"
 SLOW_FACTOR = 0.5   # 0.5 = half speed for easier observation, 1.0 = real-time, 2.0 = double speed, etc.
 
+GYRO_FILTER = 0.80 #0.70  # 0.15 = more smoothing, less noise (but more lag); 0.0 = no filtering, raw gyro data (more noise), 1.0 = full filtering, gyro rate is always 0 (not useful, frozen in time)
+VEL_FILTER = 0.60 # 0.20 = more smoothing, less noise (but more lag); 0.0 = no filtering, raw velocity data (more noise), 1.0 = full filtering, velocity is always 0 (not useful, frozen in time)
 
 #=═════════════════════════════════════════════════════════════════
 # MOVEMENT PROFILE CONFIGURATION
 #=═════════════════════════════════════════════════════════════════
-X_TARGET_FINAL = 0.50    # m — target position to reach
+X_TARGET_FINAL = 0.00    # m — target position to reach
 MOVE_VELOCITY   = 0.10  # m/s — how fast to move forward (positive) or backward (negative)
-x_target = 0.0  # Desired position (m) — we want to stay at x=0 until we decide to move
+#x_target = 0.0  # Desired position (m) — we want to stay at x=0 until we decide to move
+Y_TARGET = 0.0   # metres - want to stay centered on y=0 (no sideways movement)
 
+
+#==═════════════════════════════════════════════════════════════════
+# CASCADE PID CONTROLLER GAINS AND CONFIG
+#==═════════════════════════════════════════════════════════════════
+KP_YAW = 0.0 #0.15 #0.8  # turning correction gain
+MAX_YAW_TURN = 0.05 #0.15  # max additional wheel command for yaw correction (to prevent over-correction that could destabilize the robot)
+Y_DEADBAND = 0.03  # m - if within this distance from y=0, consider it "close enough" and don't apply yaw correction to avoid unnecessary oscillations
+YAW_FILTER = 0.85
 
 # ══════════════════════════════════════════════════════════════════
 # OUTER LOOP — VELOCITY CONTROLLER
@@ -40,19 +51,22 @@ MAX_PITCH_CORRECTION = 0.07 #0.10   # rad — max lean outer loop can command [w
 # ══════════════════════════════════════════════════════════════════
 PITCH_OFFSET       = -0.033 #-0.0333 #-0.025 #-0.035  # rad — natural equilibrium lean [was -0.04]
 INNER_KP           = 0.50    # confirmed working — do not change
-INNER_KD           = 0.025 #0.018   # confirmed working — do not change
+INNER_KD           = 0.025 #0.03 #0.018   # confirmed working — do not change
 INNER_KI           = 0.005   # REDUCED from 0.02 — was causing integral windup
 INNER_MAX_INTEGRAL = 0.03    # REDUCED from 0.05 — tighter anti-windup
 
 # ══════════════════════════════════════════════════════════════════
 # HIP AND KNEE POSTURE
 # ══════════════════════════════════════════════════════════════════
-HIP_KP  = 25.0;  HIP_KD  = 3.8
-KNEE_KP = 22.0;  KNEE_KD = 2.5
+HIP_KP  = 50.0 #25.0 
+HIP_KD  = 6.0 #3.8
+KNEE_KP = 45.0 #22.0 
+KNEE_KD = 5.0 #2.5
 
 MAX_WHEEL = 1.0
 MAX_HIP   = 1.0
 MAX_KNEE  = 1.0
+
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -98,14 +112,17 @@ def run():
     vadr = {n: model.jnt_dofadr [jid[n]] for n in jnames}
     
     #===================================================
-    # Initialising key parameters for the control loops
+    # INITIALISING KEY PARAMETERS FOR THE CONTROL LOOPS
     #===================================================
     dt             = model.opt.timestep
     #outer_integral = 0.0
     inner_integral = 0.0
     step           = 0
     x_target = 0.0  # Desired position (m) — we want to stay at x=0
-    pitch_target = 0.0  # Initial target pitch (rad) — will be updated by outer loop
+    pitch_target = PITCH_OFFSET  # Initial target pitch (rad) — will be updated by outer loop
+    pitch_rate_filtered = 0.0  # For gyro filtering
+    velocity_filtered = 0.0  # For velocity filtering
+    yaw_filtered = 0.0 
     
 
     print(f"\nCASCADE PID (FIXED v2):")
@@ -113,7 +130,7 @@ def run():
     print(f"  Inner: Kp={INNER_KP}, Kd={INNER_KD}, Ki={INNER_KI}  (pitch → wheel torque)")
     print(f"  PITCH_OFFSET = {PITCH_OFFSET:.4f} rad ({math.degrees(PITCH_OFFSET):.2f}°)")
     print("─" * 80)
-    print(f"{'Time':>6}  {'Pitch':>9}  {'Rate':>9}  {'Vel':>11}  {'PitchTgt':>11}  {'WheelU':>9}  {'XCurrent':>10}  {'Status'}")
+    print(f"{'Time':>6}  {'Pitch':>9}  {'Rate':>9}  {'Vel':>11}  {'PitchTgt':>11}  {'WheelU':>9}  {'XCurrent':>10}  {'YCurrent':>10}  {'Status'}")
     print("─" * 80)
 
     with mujoco.viewer.launch_passive(model, data) as viewer:
@@ -127,21 +144,36 @@ def run():
             sd = data.sensordata
             qw, qx, qy, qz = sd[0], sd[1], sd[2], sd[3]
             pitch      = quat_to_pitch(qw, qx, qy, qz)
-            pitch_rate = float(sd[5])
+
+            #pitch_rate = float(sd[5]) # replaced by filtered version below
+            #==═════════════════════════════════════════════════════════════════
+            # GYRO FILTERING IMPLEMENTATION [reference: https://en.wikipedia.org/wiki/Low-pass_filter#Exponential_moving_average]
+            #==═════════════════════════════════════════════════════════════════
+            pitch_rate_raw = float(sd[5])
+            pitch_rate_filtered = GYRO_FILTER * pitch_rate_filtered + (1 - GYRO_FILTER) * pitch_rate_raw
+            pitch_rate = pitch_rate_filtered  # Use the filtered gyro rate for control
+
             omega_L    = float(sd[11])
             omega_R    = float(sd[13])
-            velocity   = (omega_L + omega_R) / 2.0 * 0.06  # m/s, positive=forward
+            # velocity   = (omega_L + omega_R) / 2.0 * 0.06  # m/s, positive=forward # replaced by filtered version below
+            velocity_raw = (omega_L + omega_R) / 2.0 * 0.06  # m/s, positive=forward
+            velocity_filtered = VEL_FILTER * velocity_filtered + (1 - VEL_FILTER) * velocity_raw
+            velocity = velocity_filtered  # Use the filtered velocity for control
 
-            #keyboard.update(viewer) - This has been removed
+            #=═════════════════════════════════════════════════════════════════
+            # WITHIN MAIN LOOP: UPDATED VARIABLES AND CONTROL LOGIC
+            #=═════════════════════════════════════════════════════════════════
             active_v_ref = V_REF 
-            active_turn  = 0.00 
+            yaw_turn  = 0.00 
             #x_target = 0.0  # Desired position (m) — we want to stay at x=0
             x_current = float(data.qpos[root_qadr])  # Current x position of the robot's base
+            y_current = float(data.qpos[root_qadr + 1])  # Current y position of the robot's base
 
             #=═════════════════════════════════════════════════════════════════
             # MOVEMENT PROFILE CONFIGURATION IMPLEMENTATION
             #=═════════════════════════════════════════════════════════════════
             # Slowly advance x_target toward X_TARGET_FINAL at the specified MOVE_VELOCITY
+
             if abs(x_target - X_TARGET_FINAL) > 0.001: # Yet to arrive at target
                 step_size = MOVE_VELOCITY * dt         # How much to move x_target this timestep
                 if X_TARGET_FINAL > x_target:
@@ -149,6 +181,18 @@ def run():
                 else:
                     x_target = max(x_target - step_size, X_TARGET_FINAL)  # Move but don't overshoot
                     #Once x_target reaches X_TARGET_FINAL, it will stay there and we can observe how the robot maintains balance at the new position.
+
+            
+            # Y correction - Yaw control to keep the robot centered on the y-axis
+
+            y_error = Y_TARGET - y_current
+            if abs(y_error) < Y_DEADBAND:
+                yaw_turn = 0.0  # Within deadband, no correction
+            else:   
+                yaw_turn_raw = clamp(KP_YAW * y_error, -MAX_YAW_TURN, MAX_YAW_TURN)  # Simple proportional control to keep the robot centered on the y-axis
+                # Apply filtering to the yaw turn command to prevent oscillations
+                yaw_filtered = YAW_FILTER * yaw_filtered + (1 - YAW_FILTER) * yaw_turn_raw
+                yaw_turn = yaw_filtered  # Use the filtered yaw turn command
             
             
             # ══════════════════════════════════════════════════════════
@@ -210,8 +254,9 @@ def run():
                 -MAX_WHEEL, MAX_WHEEL
             )
 
-            data.ctrl[4] = clamp(wheel_u + active_turn, -MAX_WHEEL, MAX_WHEEL)
-            data.ctrl[5] = clamp(wheel_u - active_turn, -MAX_WHEEL, MAX_WHEEL)
+            #Remove yaw_turn from wheel commands to isolate the effect of the cascade PID controller on balance first. We can reintroduce yaw_turn later once the balance control is stable.
+            data.ctrl[4] = clamp(wheel_u, -MAX_WHEEL, MAX_WHEEL)
+            data.ctrl[5] = clamp(wheel_u, -MAX_WHEEL, MAX_WHEEL)
 
             # ── HIP POSTURE ───────────────────────────────────────────
             for jname, ctrl_idx in [("left_hip", 0), ("right_hip", 1)]:
@@ -252,6 +297,7 @@ def run():
                     f"tgt={math.degrees(pitch_target):+6.2f}°  "
                     f"{wheel_u:+6.3f}  "
                     f"x={x_current:+6.3f}m  "
+                    f"y={y_current:+6.3f}m  "
                     f"{status}"
                 )
 
