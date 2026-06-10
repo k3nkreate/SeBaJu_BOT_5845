@@ -66,7 +66,8 @@
       [13]    right wheel joint velocity (rad/s)
     =======================================================================-->
 
-    <option timestep="0.002" gravity="0 0 -9.81" integrator="RK4"/>
+    <option timestep="0.002" gravity="0 0 -9.81" integrator="RK4"
+            iterations="50" tolerance="1e-10"/>
     <compiler angle="radian"/>
 
     <default>
@@ -103,7 +104,7 @@
 
         <geom name="ground" type="plane" size="10 10 0.1"
               contype="1" conaffinity="1"
-              rgba="0.35 0.45 0.35 1" friction="1.0 0.05 0.01"/>
+              rgba="0.35 0.45 0.35 1" friction="1.0 0.3 0.01"/>
 
         <!--===================================================================
         BASE BODY — free-floating anchor (no torso_pitch joint)
@@ -130,7 +131,7 @@
 
             <!-- IMU site at top of torso 
             at top of torso cylinder (half-length 0.07 m above pivot)-->
-            <site name="imu_site" pos="0.0 0 0.07" size="0.01" rgba="1 1 0 1"/>
+            <site name="imu_site" pos="0.0 0 0.07" size="0.01" rgba="1 1 0 1" euler="0 0 0"/>
 
             <!--===============================================================
             LEFT LEG
@@ -162,7 +163,7 @@
                        axis="0 1 0"
                        range="-1.20 0.40"
                        ref="-0.785"
-                       damping="1.5"/>
+                       damping="1.5" frictionloss="0.05"/>
                   <!--changed quat to 1 0 0 0 ~ no rotation; ref provides required orientation-->
                 <geom name="left_thigh" type="capsule"
                       pos="0 0 -0.11"
@@ -180,7 +181,8 @@
                            axis="0 1 0"
                            range="0.20 1.80"
                            ref="1.571"
-                           stiffness="5" damping="2.0"/>
+                           springref="0.0"
+                           stiffness="15" damping="2.5"/>
                       <!--changed quat to 1 0 0 0 ~ no rotation; ref provides required orientation-->
                     <geom name="left_shank_geom" type="capsule"
                           pos="0 0 -0.11"
@@ -197,7 +199,7 @@
                               quat="0.7071 0.7071 0 0"
                               material="wheel_mat"
                               mass="0.3" contype="1" conaffinity="1"
-                              friction="1.5 0.05 0.01" pos="0 0.012 0"/>
+                              friction="1.5 0.3 0.01" pos="0 0.0 0"/>
                     </body>
                 </body>
             </body>
@@ -211,7 +213,7 @@
                        axis="0 1 0"
                        range="-1.20 0.40"
                        ref="-0.785"
-                       damping="1.5"/>
+                       damping="1.5" frictionloss="0.05"/>
 
                 <geom name="right_thigh" type="capsule"
                       pos="0 0 -0.11"
@@ -226,7 +228,8 @@
                            axis="0 1 0"
                            range="0.20 1.80"
                            ref="1.571"
-                           stiffness="5" damping="2.0"/>
+                           springref="0.0"
+                           stiffness="15" damping="2.5"/>
 
                     <geom name="right_shank_geom" type="capsule"
                           pos="0 0 -0.11"
@@ -243,13 +246,30 @@
                               quat="0.7071 0.7071 0 0"
                               material="wheel_mat"
                               mass="0.3" contype="1" conaffinity="1"
-                              friction="1.5 0.05 0.01" pos="0 -0.012 0"/>
+                              friction="1.5 0.3 0.01" pos="0 -0 0"/>
                     </body>
                 </body>
             </body>
 
         </body><!-- end base -->
     </worldbody>
+
+
+<!--=======================================================================
+    EQUALITY CONSTRAINTS — force left/right symmetry
+    ─────────────────────────────────────────────────────────────────────────
+    polycoef="0 1 0 0 0" means: joint2 = joint1 exactly (1:1 coupling).
+    This prevents the legs from deforming asymmetrically during yaw correction
+    or from drifting apart due to physics asymmetry.
+    solimp/solref tuned to be stiff but not rigid (avoids constraint explosion).
+    =======================================================================-->
+    <equality>
+        <joint joint1="left_hip"   joint2="right_hip"  polycoef="0 1 0 0 0"
+               solimp="0.9 0.95 0.001" solref="0.02 1"/>
+        <joint joint1="left_knee"  joint2="right_knee" polycoef="0 1 0 0 0"
+               solimp="0.9 0.95 0.001" solref="0.02 1"/>
+    </equality>
+
 
     <!--=======================================================================
     ACTUATORS
