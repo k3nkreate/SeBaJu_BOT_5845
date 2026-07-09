@@ -483,6 +483,26 @@ def run():  # Main function that loads the robot and runs the feedback loop.
     thrust_force_sum = 0.0
     thrust_force_count = 0
     average_thrust_force = 0.0
+  
+    # THRUST AND JOINT TRACKING DIAGNOSTICS
+    thrust_alpha_now = 0.0
+    thrust_alpha_takeoff = 0.0
+
+    hip_q_L = 0.0
+    hip_q_R = 0.0
+    knee_q_L = 0.0
+    knee_q_R = 0.0
+
+    hip_err_L = 0.0
+    hip_err_R = 0.0
+    knee_err_L = 0.0
+    knee_err_R = 0.0
+
+    flight_hold_valid = False
+    hip_flight_hold_L = 0.0
+    hip_flight_hold_R = 0.0
+    knee_flight_hold_L = 0.0
+    knee_flight_hold_R = 0.0
 
 
     print(f"  SLOW_FACTOR  = {SLOW_FACTOR:.2f}  (edit this to change simulation speed)")  # Print simulation speed setting.
@@ -730,6 +750,14 @@ def run():  # Main function that loads the robot and runs the feedback loop.
 
             elapsed = data.time - state_t0
 
+            # =========================================================
+            # THRUST PROGRESS DIAGNOSTIC
+            # =========================================================
+            if thrust_start_time is not None:
+                thrust_alpha_now = fast_thrust01(data.time - thrust_start_time, T_THRUST)
+            else:
+                thrust_alpha_now = 0.0
+
             # -----------------------------
             # State transitions
             # -----------------------------
@@ -810,8 +838,22 @@ def run():  # Main function that loads the robot and runs the feedback loop.
                     takeoff_time = data.time
                     takeoff_com_z = com_z
                     takeoff_com_z_vel = com_z_vel_raw
-
                     peak_air_com_z = com_z
+
+
+                    # =========================================================
+                    # FREEZE ACTUAL LEG POSE AT TAKE-OFF
+                    # =========================================================
+                    thrust_alpha_takeoff = thrust_alpha_now
+
+                    hip_flight_hold_L = float(data.qpos[qadr["left_hip"]])
+                    hip_flight_hold_R = float(data.qpos[qadr["right_hip"]])
+
+                    knee_flight_hold_L = float(data.qpos[qadr["left_knee"]])
+                    knee_flight_hold_R = float(data.qpos[qadr["right_knee"]])
+
+                    flight_hold_valid = True
+
 
                     if thrust_force_count > 0:
                         average_thrust_force = thrust_force_sum / thrust_force_count
@@ -965,10 +1007,16 @@ def run():  # Main function that loads the robot and runs the feedback loop.
                 knee_target_R = blend(knee_preload_R, knee_thrust_R, a)
 
             elif jump_state == STATE_FLIGHT:
-                hip_target_L = hip_thrust_L
-                hip_target_R = hip_thrust_R
-                knee_target_L = knee_thrust_L
-                knee_target_R = knee_thrust_R
+                if flight_hold_valid:
+                    hip_target_L = hip_flight_hold_L
+                    hip_target_R = hip_flight_hold_R
+                    knee_target_L = knee_flight_hold_L
+                    knee_target_R = knee_flight_hold_R
+                else:
+                    hip_target_L = hip_thrust_L
+                    hip_target_R = hip_thrust_R
+                    knee_target_L = knee_thrust_L
+                    knee_target_R = knee_thrust_R
 
             elif jump_state == STATE_LANDING:
                 a = smoothstep01(elapsed, T_LANDING)
@@ -997,6 +1045,21 @@ def run():  # Main function that loads the robot and runs the feedback loop.
             knee_target_R = clamp(knee_target_R, KNEE_CTRL_MIN, KNEE_CTRL_MAX)
 
             command_legs(data, qadr, vadr, LEG_ACTUATOR_MODE, act_lhip, act_rhip, act_lknee, act_rknee, hip_target_L, hip_target_R, knee_target_L, knee_target_R,)
+
+            # =========================================================
+            # ACTUAL JOINT POSITION AND TRACKING ERROR
+            # =========================================================
+            hip_q_L = float(data.qpos[qadr["left_hip"]])
+            hip_q_R = float(data.qpos[qadr["right_hip"]])
+
+            knee_q_L = float(data.qpos[qadr["left_knee"]])
+            knee_q_R = float(data.qpos[qadr["right_knee"]])
+
+            hip_err_L = hip_target_L - hip_q_L
+            hip_err_R = hip_target_R - hip_q_R
+
+            knee_err_L = knee_target_L - knee_q_L
+            knee_err_R = knee_target_R - knee_q_R
 
             # =========================================================
             # LEG ACTUATOR FORCE MONITORING
@@ -1065,6 +1128,9 @@ def run():  # Main function that loads the robot and runs the feedback loop.
                         f"TauH={hip_tau_L:+6.1f} "
                         f"TauK={knee_tau_L:+6.1f} "
                         f"LegSat={int(leg_sat)} "
+                        f"ThrA={thrust_alpha_now:4.2f} "
+                        f"Hq={hip_q_L:+5.2f} Kq={knee_q_L:+5.2f} "
+                        f"He={hip_err_L:+5.2f} Ke={knee_err_L:+5.2f} "
                         f"{status}"
 )
 
