@@ -38,13 +38,13 @@ ACCEL_BLEND = 0.0  # Small blend from accelerometer tilt; keep low because accel
 # ============================================================
 # CONTROLLER TUNING CONSTANTS
 # ============================================================
-PITCH_OFFSET = 0.0
+PITCH_OFFSET =  math.radians(4.73) #0.0
 MAX_WHEEL = 0.35
 
 K_THETA   = 1.3 #1.3    # forward lean correction
 K_THETA_D = 0.17 #0.23  # lean-rate damping
-K_X_D     = 0.16 #0.07   # velocity damping #4.0    # forward lean correction
-K_X       = 0.85 #0.8 #0.5 #0.035    # position-hold stiffness
+K_X_D     = 0.16 #0.07  # velocity damping #4.0    # forward lean correction
+K_X       = 0.8 #0.85 #0.5 #0.035    # position-hold stiffness
 
 COM_RATE_FILTER = 0.85
 VEL_FILTER = 0.70
@@ -60,6 +60,76 @@ WHEEL_MOTOR_SIGN = -1
 # LEG_ACTUATOR_MODE = "motor_pd"
 LEG_ACTUATOR_MODE = "position_servo"
 
+#===========================================================================================
+# JUMP TEST
+JUMP_ENABLE = True
+JUMP_START_TIME = 5.0
+JUMP_ONCE = True
+
+STATE_BALANCE = "BALANCE"
+STATE_PRELOAD = "PRELOAD"
+STATE_THRUST = "THRUST"
+STATE_FLIGHT = "FLIGHT"
+STATE_LANDING = "LANDING"
+STATE_RECOVERY = "RECOVERY"
+
+# JUMP TIMING AND DETECTION SETTINGS
+T_PRELOAD = 0.80                   # Slow crouch time, seconds.
+# T_THRUST should ot be smaller than dt, to achieve a controlled jump with mujoco timestep of 0.002s, T_THRUST = 0.05 is a good value for a controlled jump
+T_THRUST = 0.04 #0.14                    # Fast extension time, seconds.
+T_THRUST_MAX = 0.16 #0.12                # Safety timeout if wheels never leave ground.
+T_LANDING = 0.60 #0.35                   # Time to absorb landing.
+T_RECOVERY = 1.50 #1.00                  # Time to return from landing pose to standing pose.
+
+# CONTACT FORCE HYSTERESIS SETTINGS
+G = 9.81
+
+# These are ratios. The actual force thresholds will be calculated
+# inside run(), after MuJoCo has loaded the model.
+F_CONTACT_OFF_RATIO = 0.03
+F_CONTACT_ON_RATIO  = 0.15
+
+F_CONTACT_OFF_MIN = 1.5
+F_CONTACT_ON_MIN  = 6.0
+
+CONTACT_LOSS_DEBOUNCE = 0.004     # 2 steps at dt=0.002
+CONTACT_GAIN_DEBOUNCE = 0.012     # 6 steps at dt=0.002
+
+TAKEOFF_VZ_MIN = 0.08           # m/s
+
+COMZ_VEL_FILTER = 0.40            # Less filtering so take-off velocity is not hidden.
+
+PRINT_DT_NORMAL = 0.50            # normal print interval
+PRINT_DT_JUMP = 0.02              # print faster during jump phases
+
+CONTACT_FORCE_MIN = 1.0           # Newton; tune later
+
+# =========================================================
+# WHEEL CLEARANCE SETTINGS
+# =========================================================
+# Absolute clearance: true geometric clearance above ground.
+WHEEL_CLEARANCE_TAKEOFF_ABS = 0.0005   # 0.5 mm, for detecting micro take-off
+
+# Relative clearance: lift compared with normal loaded wheel position.
+WHEEL_CLEARANCE_TAKEOFF_REL = 0.0030   # 3 mm relative lift
+
+# Target for a visible jump, not for state switching.
+VISIBLE_WHEEL_CLEARANCE_TARGET = 0.010 # 10 mm visible wheel clearance
+
+# ------------------------------------------------------------------------
+# First safe joint offsets. If crouch/extension moves in the wrong physical direction, flip these signs.
+HIP_PRELOAD_DELTA  = +0.12 #+0.20         # rad, crouch hip target relative to standing pose.
+KNEE_PRELOAD_DELTA = -0.22 #-0.35         # rad, crouch knee target relative to standing pose.
+
+HIP_THRUST_DELTA   = -0.24 #-0.22           # rad, extension hip target relative to standing pose.
+KNEE_THRUST_DELTA  = +0.40 #+0.36          # rad, extension knee target relative to standing pose.
+
+HIP_LAND_DELTA     = +0.10         # rad, landing absorption hip target relative to standing pose.
+KNEE_LAND_DELTA    = -0.25         # rad, landing absorption knee target relative to standing pose.
+
+# Safety limits matching your XML ctrlrange for position actuators.
+HIP_CTRL_MIN, HIP_CTRL_MAX = -0.60, 0.60
+KNEE_CTRL_MIN, KNEE_CTRL_MAX = -0.80, 0.80
 
 # =============================================================
 # LEG LOCK GAINS SPECIFICALLY FOR HIP AND KNEE "ACTUATOR-MOTOR"
@@ -160,7 +230,101 @@ def command_legs(
 
     else:
         raise RuntimeError("Invalid leg actuator mode.")
-    
+
+def smoothstep01(t, T):
+    """
+    Smooth 0-to-1 transition.
+    Purpose: avoid instant jumps in hip/knee targets.
+    sigma(0)=0, sigma(1)=1, and slope is zero at both ends.
+    """
+    if T <= 0.0:
+        return 1.0
+    tau = clamp(t / T, 0.0, 1.0)
+    return 3.0 * tau**2 - 2.0 * tau**3
+
+def fast_thrust01(t, T):
+    """
+    Faster thrust transition than smoothstep.
+    It gives more leg extension early in the thrust phase,
+    which improves upward impulse before the wheels unload.
+    """
+    if T <= 0.0:
+        return 1.0
+
+    tau = clamp(t / T, 0.0, 1.0)
+
+    # Fast ease-out curve:
+    # rises quickly at the start, then slows near the end.
+    return 1.0 - (1.0 - tau)**3
+
+
+def blend(a, b, alpha):
+    """
+    Interpolate between two joint targets.
+    alpha=0 returns a, alpha=1 returns b.
+    """
+    return a + (b - a) * alpha
+
+
+def wheel_ground_contact_info(model, data, ground_gid, left_wheel_gid, right_wheel_gid):
+    """
+    Returns:
+        left_pair, right_pair, left_fn, right_fn
+
+    left_pair/right_pair:
+        True if MuJoCo reports a contact pair.
+
+    left_fn/right_fn:
+        Normal contact force at each wheel.
+    """
+    left_pair = False
+    right_pair = False
+
+    left_fn = 0.0
+    right_fn = 0.0
+
+    contact_force = np.zeros(6)
+
+    for i in range(data.ncon):
+        con = data.contact[i]
+        pair = {con.geom1, con.geom2}
+
+        mujoco.mj_contactForce(model, data, i, contact_force)
+        normal_force = max(0.0, float(contact_force[0]))
+
+        if ground_gid in pair and left_wheel_gid in pair:
+            left_pair = True
+            left_fn += normal_force
+
+        if ground_gid in pair and right_wheel_gid in pair:
+            right_pair = True
+            right_fn += normal_force
+
+    return left_pair, right_pair, left_fn, right_fn
+
+
+def balance_gains_for_state(state):
+    """
+    Stage-aware balance gains.
+    During thrust, position hold is weakened so the wheels do not fight the leg extension.
+    During landing, damping is increased to help recovery.
+    """
+    if state == STATE_BALANCE:
+        return K_THETA, K_THETA_D, K_X_D, K_X, MAX_WHEEL
+    if state == STATE_PRELOAD:
+        return K_THETA, 0.22, 0.20, 0.50 * K_X, MAX_WHEEL
+    if state == STATE_THRUST:
+        return K_THETA, 0.25, 0.18, 0.10 * K_X, MAX_WHEEL
+    if state == STATE_FLIGHT:
+        return K_THETA, 0.10, 0.00, 0.00, 0.10
+    if state == STATE_LANDING:
+        return K_THETA, 0.25, 0.18, 0.10 * K_X, MAX_WHEEL
+    if state == STATE_RECOVERY:
+        return K_THETA, 0.22, 0.18, 0.40 * K_X, MAX_WHEEL
+    return K_THETA, K_THETA_D, K_X_D, K_X, MAX_WHEEL
+
+
+
 #============================================================================================================================================
 # MAIN FUNCTION
 #============================================================================================================================================
@@ -173,6 +337,20 @@ def run():  # Main function that loads the robot and runs the feedback loop.
     print(f"\nLoading: {xml_path}")  # Tell the user which XML is being loaded.
     model = mujoco.MjModel.from_xml_path(xml_path)  # Load the MuJoCo model from the XML file.
     data = mujoco.MjData(model)  # Create the live simulation data structure for this model.
+
+    # =========================================================
+    # Robot mass and contact thresholds
+    # =========================================================
+    robot_mass = float(np.sum(model.body_mass))
+    robot_weight = robot_mass * G
+
+    F_CONTACT_OFF = max(F_CONTACT_OFF_MIN, F_CONTACT_OFF_RATIO * robot_weight)
+    F_CONTACT_ON  = max(F_CONTACT_ON_MIN,  F_CONTACT_ON_RATIO  * robot_weight)
+
+    print(f"  Robot mass   = {robot_mass:.3f} kg")
+    print(f"  Robot weight = {robot_weight:.3f} N")
+    print(f"  Contact OFF threshold = {F_CONTACT_OFF:.3f} N")
+    print(f"  Contact ON threshold  = {F_CONTACT_ON:.3f} N")
 
     #This block needs to be changed
     key_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "stand")  # Look for the standing keyframe in the XML.
@@ -219,6 +397,16 @@ def run():  # Main function that loads the robot and runs the feedback loop.
             "Unknown LEG_ACTUATOR_MODE. Use 'motor_pd' or 'position_servo'."
         )
 
+    # ============================================================================================
+    # Contact geom IDs for take-off / landing detection
+    # ============================================================================================
+    ground_gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "ground")
+    left_wheel_gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "left_wheel_geom")
+    right_wheel_gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "right_wheel_geom")
+
+    if min(ground_gid, left_wheel_gid, right_wheel_gid) < 0:
+        raise RuntimeError("Ground or wheel geom not found. Check XML geom names.")
+    
     # Obtaining initial data from SeBaJu Model 
     mujoco.mj_forward(model, data)  # Update sensors before taking calibration measurements.
     imu_q0 = sensor_data(model, data, "imu_quat")  # Read the initial IMU quaternion.
@@ -245,8 +433,58 @@ def run():  # Main function that loads the robot and runs the feedback loop.
     knee_ref_L = float(data.qpos[qadr["left_knee"]])
     knee_ref_R = float(data.qpos[qadr["right_knee"]])
 
-
+    # =========================================================
+    # Jump state variables initialization
+    # =========================================================
+    # States and Boolean flags for jump state machine
+    jump_state = STATE_BALANCE
+    jump_done = False
+    loaded_state = True        # True means robot is load-bearing on the ground
     
+    # Velocity and position variables for jump state machine
+    prev_com_z = float(com0[2])
+    com_z_vel_filtered = 0.0
+    preload_min_com_z = float(com0[2]) # lowest CoM during crouch
+    takeoff_com_z = None
+    takeoff_com_z_vel = None
+    landing_com_z = None
+    jump_height_from_takeoff = 0.0
+    jump_height_from_stand = 0.0
+    v_takeoff_from_height = 0.0
+    stand_com_z = None
+    takeoff_com_z = None
+    landing_com_z = None
+    peak_com_z = -np.inf
+    peak_air_com_z = -np.inf
+    jump_height_airborne = 0.0
+    jump_height_total = 0.0
+    v_takeoff_from_air = 0.0
+    jump_height_from_crouch = 0.0
+    jump_height_above_stand_air = 0.0
+    wheel_gap_ref = None
+    gap_rel = 0.0
+    peak_gap_abs = -np.inf
+    peak_gap_rel = -np.inf
+    
+    # Timers for jump phases
+    air_timer = 0.0 # DELETE
+    contact_timer = 0.0 # DELETE
+    unloaded_timer = 0.0
+    loaded_timer = 0.0
+    state_t0 = 0.0
+    takeoff_time = None
+    landing_time = None
+    thrust_start_time = None
+    thrust_duration_actual = None
+    flight_time = 0.0
+    
+    # Force and thrust variables for jump state machine
+    total_normal_force = 0.0
+    thrust_force_sum = 0.0
+    thrust_force_count = 0
+    average_thrust_force = 0.0
+
+
     print(f"  SLOW_FACTOR  = {SLOW_FACTOR:.2f}  (edit this to change simulation speed)")  # Print simulation speed setting.
     print("-" * 100)  # Print separator line.
     print(f"{'Time':>6} {'Pitch':>9} {'CoMLean':>9} {'Rate':>9} {'Vel':>9} {'WheelU':>8} {'X':>8} {'COMx':>8} {'COMz':>8} {'IMUx':>8} {'IMUz':>8} {'OffX':>8} {'OffZ':>8} {'MoveDir':>9} {'Status'}")
@@ -267,8 +505,59 @@ def run():  # Main function that loads the robot and runs the feedback loop.
             imu_a = sensor_data(model, data, "imu_accel")  # Read IMU acceleration; corrected below using IMU-to-CoM offset.
             imu_pos = sensor_data(model, data, "imu_pos") # Read IMU position
             com = sensor_data(model, data, "robot_com")  # Read whole-robot center of mass.
+            
+            # -------------------------------------------------
+            # Vertical CoM velocity for jump monitoring
+            # -------------------------------------------------
+            com_z = float(com[2])
+            com_z_vel_raw = (com_z - prev_com_z) / dt
+            prev_com_z = com_z
+            # Filtered velocity is only for display, not event detection
+            com_z_vel_filtered = COMZ_VEL_FILTER * com_z_vel_filtered + (1.0 - COMZ_VEL_FILTER) * com_z_vel_raw
+            com_z_vel = com_z_vel_filtered
+
+            # Track lowest CoM during preload/crouch.
+            if jump_state == STATE_PRELOAD:
+                preload_min_com_z = min(preload_min_com_z, com_z)
+
+            
+
             wl = sensor_data(model, data, "left_wheel_pos")  # Read left wheel center.
             wr = sensor_data(model, data, "right_wheel_pos")  # Read right wheel center.
+
+            # =========================================================
+            # WHEEL HEIGHT / CLEARANCE ABOVE GROUND
+            # =========================================================
+            left_wheel_gap = float(wl[2]) - WHEEL_RADIUS
+            right_wheel_gap = float(wr[2]) - WHEEL_RADIUS
+            min_wheel_gap = min(left_wheel_gap, right_wheel_gap)
+
+            # =========================================================
+            # WHEEL CLEARANCE: ABSOLUTE AND RELATIVE
+            # =========================================================
+            if wheel_gap_ref is None:
+                gap_rel = 0.0
+            else:
+                gap_rel = min_wheel_gap - wheel_gap_ref
+
+            # Track peak wheel clearance during the jump attempt.
+            if jump_state in [
+                STATE_PRELOAD,
+                STATE_THRUST,
+                STATE_FLIGHT,
+                STATE_LANDING,
+                STATE_RECOVERY
+            ]:
+                peak_gap_abs = max(peak_gap_abs, min_wheel_gap)
+                peak_gap_rel = max(peak_gap_rel, gap_rel)
+
+            # Take-off is accepted when the wheels are both:
+            # 1. physically just above the ground, and
+            # 2. lifted relative to their loaded baseline.
+            wheel_clear_air = (
+                min_wheel_gap > WHEEL_CLEARANCE_TAKEOFF_ABS
+                and gap_rel > WHEEL_CLEARANCE_TAKEOFF_REL
+            )
 
             imu_to_com = com - imu_pos                          # Offset from IMU to real whole-robot CoM.
             imu_to_com_x = float(imu_to_com[0])                 # Forward/backward offset.
@@ -322,43 +611,422 @@ def run():  # Main function that loads the robot and runs the feedback loop.
             y_current = float(data.qpos[root_qadr + 1])  # Read the torso world Y position for camera tracking.
             viewer.cam.lookat[:] = [x_current, y_current, BASE_HEIGHT]  # Keep the camera centered on the robot.
 
+
+            # =========================================================
+            # FORCE-BASED WHEEL CONTACT DETECTION WITH HYSTERESIS
+            # =========================================================
+            left_pair, right_pair, left_fn, right_fn = wheel_ground_contact_info(
+                model, data,
+                ground_gid,
+                left_wheel_gid,
+                right_wheel_gid
+            )
+
+            Fn_total = left_fn + right_fn
+
+            # Track contact force during thrust.
+            if jump_state == STATE_THRUST:
+                thrust_force_sum += Fn_total
+                thrust_force_count += 1
+
+            # Schmitt trigger / hysteresis logic
+            if loaded_state:
+                # We are currently considered on the ground.
+                # Only declare airborne if force stays very low.
+                if Fn_total < F_CONTACT_OFF:
+                    unloaded_timer += dt
+                else:
+                    unloaded_timer = 0.0
+
+                if unloaded_timer >= CONTACT_LOSS_DEBOUNCE:
+                    loaded_state = False
+                    loaded_timer = 0.0
+
+            else:
+                # We are currently considered airborne.
+                # Only declare landed if force becomes clearly load-bearing.
+                if Fn_total > F_CONTACT_ON:
+                    loaded_timer += dt
+                else:
+                    loaded_timer = 0.0
+
+                if loaded_timer >= CONTACT_GAIN_DEBOUNCE:
+                    loaded_state = True
+                    unloaded_timer = 0.0
+
+            airborne = not loaded_state
+
+            # =========================================================
+            # PEAK HEIGHT TRACKING
+            # =========================================================
+
+            # Overall peak during the whole jump attempt
+            if jump_state in [
+                STATE_PRELOAD,
+                STATE_THRUST,
+                STATE_FLIGHT,
+                STATE_LANDING,
+                STATE_RECOVERY
+            ]:
+                peak_com_z = max(peak_com_z, com_z)
+
+            # Peak during confirmed flight
+            if jump_state == STATE_FLIGHT:
+                peak_air_com_z = max(peak_air_com_z, com_z)
+
             # ===============================================
-            # DIRECT STATE-FEEDBACK BALANCER
+            # JUMP STAGE-AWARE DIRECT STATE-FEEDBACK BALANCER
             # =====================================================
             theta_ref = PITCH_OFFSET
             x_ref = 0.0
 
-            wheel_u = clamp(
-                            K_THETA   * (theta - theta_ref)
-                            + K_THETA_D * theta_dot
-                            - K_X_D   * xdot
-                            - K_X     * (x - x_ref),
-                            -MAX_WHEEL, MAX_WHEEL
+            Kth, Kthd, Kxd, Kx, max_wheel_state = balance_gains_for_state(jump_state)
+
+            wheel_u_raw = clamp(
+                            Kth   * (theta - theta_ref)
+                            + Kthd * theta_dot
+                            - Kxd  * xdot
+                            - Kx   * (x - x_ref),
+                            -max_wheel_state, max_wheel_state
                         )
 
-            wheel_u = WHEEL_MOTOR_SIGN * wheel_u
+            wheel_u = WHEEL_MOTOR_SIGN * wheel_u_raw
             data.ctrl[act_lwheel] = wheel_u
             data.ctrl[act_rwheel] = wheel_u
 
             # ============================================================================================================
-            # HIP/KNEE TARGETS
-            # For now, hold the initial standing pose.
-            # Later, these same variables will become jump trajectories.
+            # JUMP STATE MACHINE + HIP/KNEE TARGET GENERATION
             # ============================================================================================================
-            hip_target_L = hip_ref_L
-            hip_target_R = hip_ref_R
 
-            knee_target_L = knee_ref_L
-            knee_target_R = knee_ref_R
+            # Standing targets are the initial joint angles measured after mj_forward().
+            hip_stand_L = hip_ref_L
+            hip_stand_R = hip_ref_R
+            knee_stand_L = knee_ref_L
+            knee_stand_R = knee_ref_R
+
+            # Preload/crouch targets.
+            hip_preload_L = hip_ref_L + HIP_PRELOAD_DELTA
+            hip_preload_R = hip_ref_R + HIP_PRELOAD_DELTA
+            knee_preload_L = knee_ref_L + KNEE_PRELOAD_DELTA
+            knee_preload_R = knee_ref_R + KNEE_PRELOAD_DELTA
+
+            # Thrust/extension targets.
+            hip_thrust_L = hip_ref_L + HIP_THRUST_DELTA
+            hip_thrust_R = hip_ref_R + HIP_THRUST_DELTA
+            knee_thrust_L = knee_ref_L + KNEE_THRUST_DELTA
+            knee_thrust_R = knee_ref_R + KNEE_THRUST_DELTA
+
+            # Landing absorption targets.
+            hip_land_L = hip_ref_L + HIP_LAND_DELTA
+            hip_land_R = hip_ref_R + HIP_LAND_DELTA
+            knee_land_L = knee_ref_L + KNEE_LAND_DELTA
+            knee_land_R = knee_ref_R + KNEE_LAND_DELTA
+
+            stable_for_jump = (
+                abs(theta - theta_ref) < math.radians(2.5)
+                and abs(xdot) < 0.08
+                and loaded_state
+            )
+
+            elapsed = data.time - state_t0
+
+            # -----------------------------
+            # State transitions
+            # -----------------------------
+            if jump_state == STATE_BALANCE:
+                if (
+                    JUMP_ENABLE
+                    and not jump_done
+                    and data.time > JUMP_START_TIME
+                    and stable_for_jump
+                ):
+                    jump_state = STATE_PRELOAD
+                    state_t0 = data.time
+
+                    # Reset jump measurements at the actual start of the jump attempt.
+                    stand_com_z = com_z
+                    preload_min_com_z = com_z
+
+                    # Wheel gap reference at the start of the jump attempt.
+                    # This captures the normal loaded wheel penetration/contact offset.
+                    wheel_gap_ref = min_wheel_gap
+
+                    peak_gap_abs = min_wheel_gap
+                    peak_gap_rel = 0.0
+
+                    peak_com_z = com_z
+                    peak_air_com_z = -np.inf
+
+                    takeoff_com_z = None
+                    landing_com_z = None
+
+                    jump_height_airborne = 0.0
+                    jump_height_total = 0.0
+                    jump_height_from_crouch = 0.0
+                    jump_height_above_stand_air = 0.0
+                    v_takeoff_from_air = 0.0
+                    flight_time = 0.0
+
+                    print(
+                        f"\n>>> JUMP STATE: PRELOAD "
+                        f"t={data.time:.4f}s "
+                        f"StandZ={stand_com_z:.4f}"
+                    )
+
+
+            # =============================================================================
+            elif jump_state == STATE_PRELOAD:
+                if elapsed >= T_PRELOAD:
+                    jump_state = STATE_THRUST
+                    state_t0 = data.time
+                    thrust_start_time = data.time
+
+                    # Reset thrust force measurement.
+                    thrust_force_sum = 0.0
+                    thrust_force_count = 0
+
+                    print(
+                        f"\n>>> JUMP STATE: THRUST "
+                        f"t={data.time:.4f}s "
+                        f"COMz={com_z:.4f} "
+                        f"PreloadMinZ={preload_min_com_z:.4f}"
+                    )
+
+
+            # =============================================================================
+            elif jump_state == STATE_THRUST:
+
+                takeoff_detected = (
+                    airborne
+                    and Fn_total < F_CONTACT_OFF
+                    and wheel_clear_air
+                    and com_z_vel_raw > TAKEOFF_VZ_MIN
+                )
+
+                if takeoff_detected:
+                    jump_state = STATE_FLIGHT
+                    state_t0 = data.time
+
+                    takeoff_time = data.time
+                    takeoff_com_z = com_z
+                    takeoff_com_z_vel = com_z_vel_raw
+
+                    peak_air_com_z = com_z
+
+                    if thrust_force_count > 0:
+                        average_thrust_force = thrust_force_sum / thrust_force_count
+                    else:
+                        average_thrust_force = 0.0
+
+                    print(
+                        f"\n>>> TAKE-OFF DETECTED "
+                        f"t={takeoff_time:.4f}s "
+                        f"COMz={takeoff_com_z:.4f} "
+                        f"Vz_raw={takeoff_com_z_vel:.4f} "
+                        f"Fn={Fn_total:.2f}N "
+                        f"GapAbs={min_wheel_gap:.4f}m "
+                        f"GapRel={gap_rel:.4f}m "
+                        f"pair=({int(left_pair)},{int(right_pair)}) "
+                        f"loaded={int(loaded_state)}"
+                    )
+
+                elif elapsed >= T_THRUST_MAX:
+                    jump_state = STATE_LANDING
+                    state_t0 = data.time
+
+                    print(
+                        f"\n>>> NO TAKE-OFF: SAFE LANDING "
+                        f"t={data.time:.4f}s "
+                        f"COMz={com_z:.4f} "
+                        f"Fn={Fn_total:.2f}N"
+                    )
+            # =============================================================================
+
+
+            elif jump_state == STATE_FLIGHT:
+
+                # Continue updating airborne peak during FLIGHT
+                peak_air_com_z = max(peak_air_com_z, com_z)
+
+                landing_detected = loaded_state
+
+                if landing_detected:
+                    jump_state = STATE_LANDING
+                    state_t0 = data.time
+
+                    landing_time = data.time
+                    landing_com_z = com_z
+
+                    if takeoff_time is not None:
+                        flight_time = landing_time - takeoff_time
+                    else:
+                        flight_time = 0.0
+
+                    if takeoff_com_z is not None and np.isfinite(peak_air_com_z):
+                        jump_height_airborne = max(0.0, peak_air_com_z - takeoff_com_z)
+                    else:
+                        jump_height_airborne = 0.0
+
+                    # Height of the airborne peak relative to standing height.
+                    # This can be zero if the robot takes off from a deep crouch
+                    # but does not rise above the original standing CoM height before first contact returns.
+                    if stand_com_z is not None and np.isfinite(peak_air_com_z):
+                        jump_height_above_stand_air = max(0.0, peak_air_com_z - stand_com_z)
+                    else:
+                        jump_height_above_stand_air = 0.0
+
+                    if jump_height_airborne > 0.0:
+                        v_takeoff_from_air = math.sqrt(2.0 * G * jump_height_airborne)
+                    else:
+                        v_takeoff_from_air = 0.0
+
+                    print(
+                        f"\n>>> LANDING DETECTED "
+                        f"t={landing_time:.4f}s "
+                        f"FlightTime={flight_time:.4f}s "
+                        f"TakeoffZ={takeoff_com_z:.4f} "
+                        f"PeakAirZ={peak_air_com_z:.4f} "
+                        f"PeakZ={peak_com_z:.4f} "
+                        f"LandingZ={landing_com_z:.4f} "
+                        f"H_airborne={jump_height_airborne:.4f}m "
+                        f"H_above_stand_air={jump_height_above_stand_air:.4f}m "
+                        f"Vto_air_est={v_takeoff_from_air:.4f}m/s "
+                        f"Favg_thrust={average_thrust_force:.2f}N"
+                    )
+            # ============================================================================================================
+
+
+            elif jump_state == STATE_LANDING:
+                if elapsed >= T_LANDING:
+                    jump_state = STATE_RECOVERY
+                    state_t0 = data.time
+                    print("\n>>> JUMP STATE: RECOVERY")
+
+
+            # ============================================================================================================
+            elif jump_state == STATE_RECOVERY:
+                if elapsed >= T_RECOVERY:
+
+                    # Final full-attempt measurements.
+                    # These are calculated at the end, after landing/recovery has allowed peak_com_z to update.
+                    if stand_com_z is not None and np.isfinite(peak_com_z):
+                        jump_height_total = max(0.0, peak_com_z - stand_com_z)
+                    else:
+                        jump_height_total = 0.0
+
+                    if np.isfinite(peak_com_z):
+                        jump_height_from_crouch = max(0.0, peak_com_z - preload_min_com_z)
+                    else:
+                        jump_height_from_crouch = 0.0
+
+                    jump_state = STATE_BALANCE
+                    state_t0 = data.time
+                    jump_done = JUMP_ONCE
+
+                    print("\n>>> JUMP STATE: BALANCE / RECOVERED")
+                    print(
+                        f">>> FINAL JUMP SUMMARY "
+                        f"FlightTime={flight_time:.4f}s "
+                        f"H_airborne={jump_height_airborne:.4f}m "
+                        f"H_total={jump_height_total:.4f}m "
+                        f"H_from_crouch={jump_height_from_crouch:.4f}m "
+                        f"PeakGapAbs={peak_gap_abs:.4f}m "
+                        f"PeakGapRel={peak_gap_rel:.4f}m "
+                        f"StandZ={stand_com_z:.4f} "
+                        f"PreloadMinZ={preload_min_com_z:.4f} "
+                        f"PeakZ={peak_com_z:.4f} "
+                        f"Vto_air_est={v_takeoff_from_air:.4f}m/s "
+                        f"Favg_thrust={average_thrust_force:.2f}N"
+                    )
+
+            elapsed = data.time - state_t0
+
+            # -----------------------------
+            # Leg target generation for each state
+            # -----------------------------
+            if jump_state == STATE_BALANCE:
+                hip_target_L = hip_stand_L
+                hip_target_R = hip_stand_R
+                knee_target_L = knee_stand_L
+                knee_target_R = knee_stand_R
+
+            elif jump_state == STATE_PRELOAD:
+                a = smoothstep01(elapsed, T_PRELOAD)
+                hip_target_L = blend(hip_stand_L, hip_preload_L, a)
+                hip_target_R = blend(hip_stand_R, hip_preload_R, a)
+                knee_target_L = blend(knee_stand_L, knee_preload_L, a)
+                knee_target_R = blend(knee_stand_R, knee_preload_R, a)
+
+            elif jump_state == STATE_THRUST:
+                a = fast_thrust01(elapsed, T_THRUST)
+                hip_target_L = blend(hip_preload_L, hip_thrust_L, a)
+                hip_target_R = blend(hip_preload_R, hip_thrust_R, a)
+                knee_target_L = blend(knee_preload_L, knee_thrust_L, a)
+                knee_target_R = blend(knee_preload_R, knee_thrust_R, a)
+
+            elif jump_state == STATE_FLIGHT:
+                hip_target_L = hip_thrust_L
+                hip_target_R = hip_thrust_R
+                knee_target_L = knee_thrust_L
+                knee_target_R = knee_thrust_R
+
+            elif jump_state == STATE_LANDING:
+                a = smoothstep01(elapsed, T_LANDING)
+                hip_target_L = blend(hip_thrust_L, hip_land_L, a)
+                hip_target_R = blend(hip_thrust_R, hip_land_R, a)
+                knee_target_L = blend(knee_thrust_L, knee_land_L, a)
+                knee_target_R = blend(knee_thrust_R, knee_land_R, a)
+
+            elif jump_state == STATE_RECOVERY:
+                a = smoothstep01(elapsed, T_RECOVERY)
+                hip_target_L = blend(hip_land_L, hip_stand_L, a)
+                hip_target_R = blend(hip_land_R, hip_stand_R, a)
+                knee_target_L = blend(knee_land_L, knee_stand_L, a)
+                knee_target_R = blend(knee_land_R, knee_stand_R, a)
+
+            else:
+                hip_target_L = hip_stand_L
+                hip_target_R = hip_stand_R
+                knee_target_L = knee_stand_L
+                knee_target_R = knee_stand_R
+
+            # Clamp to XML actuator ctrlranges.
+            hip_target_L = clamp(hip_target_L, HIP_CTRL_MIN, HIP_CTRL_MAX)
+            hip_target_R = clamp(hip_target_R, HIP_CTRL_MIN, HIP_CTRL_MAX)
+            knee_target_L = clamp(knee_target_L, KNEE_CTRL_MIN, KNEE_CTRL_MAX)
+            knee_target_R = clamp(knee_target_R, KNEE_CTRL_MIN, KNEE_CTRL_MAX)
 
             command_legs(data, qadr, vadr, LEG_ACTUATOR_MODE, act_lhip, act_rhip, act_lknee, act_rknee, hip_target_L, hip_target_R, knee_target_L, knee_target_R,)
+
+            # =========================================================
+            # LEG ACTUATOR FORCE MONITORING
+            # =========================================================
+            hip_tau_L = float(data.actuator_force[act_lhip])
+            hip_tau_R = float(data.actuator_force[act_rhip])
+            knee_tau_L = float(data.actuator_force[act_lknee])
+            knee_tau_R = float(data.actuator_force[act_rknee])
+
+            LEG_FORCE_LIMIT = 60.0
+
+            leg_sat = (
+                abs(hip_tau_L) > 0.98 * LEG_FORCE_LIMIT or
+                abs(hip_tau_R) > 0.98 * LEG_FORCE_LIMIT or
+                abs(knee_tau_L) > 0.98 * LEG_FORCE_LIMIT or
+                abs(knee_tau_R) > 0.98 * LEG_FORCE_LIMIT
+            )
             # ==================================================================================================================================
+                
                 
             mujoco.mj_step(model, data)  # Advance the physics by one timestep using the current controls.
             time.sleep(dt * SLOW_FACTOR)  # Slow down or speed up the visible simulation rate.
             viewer.sync()  # Update the viewer window with the latest simulation state.
 
-            if step % 250 == 0:  # Print diagnostics roughly twice per second at 500 Hz.
+            if jump_state == STATE_BALANCE:
+                print_every = max(1, int(PRINT_DT_NORMAL / dt))
+            else:
+                print_every = max(1, int(PRINT_DT_JUMP / dt))
+
+            if step % print_every == 0:  # During balance: print every 0.50 s; During jump: print every 0.02 s
                 if abs(wheel_u) >= MAX_WHEEL * 0.98:  # Check whether wheel command is saturating.
                     status = "SATURATED / reduce gain"  # Explain that gains may be too high.
                 elif abs(theta - theta_ref) < 0.035 and abs(xdot) < 0.08:  # Check if balance and speed are both close to zero.
@@ -382,6 +1050,21 @@ def run():  # Main function that loads the robot and runs the feedback loop.
                         f"{imu_to_com_x:+7.3f} "
                         f"{imu_to_com_z:+7.3f} "
                         f"{move_dir:>9} "
+                        f"{jump_state:>9} "
+                        f"COMzV={com_z_vel:+6.3f} "
+                        f"VzRaw={com_z_vel_raw:+6.3f} "
+                        f"pair=({int(left_pair)},{int(right_pair)}) "
+                        f"Fn={Fn_total:6.2f}N "
+                        f"GapAbs={min_wheel_gap:+7.4f}m "
+                        f"GapRel={gap_rel:+7.4f}m "
+                        f"Gap={min_wheel_gap:+6.4f}m "
+                        f"loaded={int(loaded_state)} "
+                        f"air={int(airborne)} "
+                        f"Hip={hip_target_L:+5.2f} Knee={knee_target_L:+5.2f} "
+                        f"PeakZ={peak_com_z:+6.3f} "
+                        f"TauH={hip_tau_L:+6.1f} "
+                        f"TauK={knee_tau_L:+6.1f} "
+                        f"LegSat={int(leg_sat)} "
                         f"{status}"
 )
 
