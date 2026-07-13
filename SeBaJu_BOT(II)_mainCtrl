@@ -72,14 +72,15 @@ STATE_THRUST = "THRUST"
 STATE_FLIGHT = "FLIGHT"
 STATE_LANDING = "LANDING"
 STATE_RECOVERY = "RECOVERY"
+STATE_SETTLE = "SETTLE"
 
 # JUMP TIMING AND DETECTION SETTINGS
 T_PRELOAD = 0.80                   # Slow crouch time, seconds.
 # T_THRUST should ot be smaller than dt, to achieve a controlled jump with mujoco timestep of 0.002s, T_THRUST = 0.05 is a good value for a controlled jump
-T_THRUST = 0.04 #0.14                    # Fast extension time, seconds.
+T_THRUST = 0.02 #0.035 #0.04 #0.14                    # Fast extension time, seconds.
 T_THRUST_MAX = 0.16 #0.12                # Safety timeout if wheels never leave ground.
-T_LANDING = 0.60 #0.35                   # Time to absorb landing.
-T_RECOVERY = 1.50 #1.00                  # Time to return from landing pose to standing pose.
+T_LANDING = 0.80 #0.35                   # Time to absorb landing.
+T_RECOVERY = 2.00 #1.00                  # Time to return from landing pose to standing pose.
 
 # CONTACT FORCE HYSTERESIS SETTINGS
 G = 9.81
@@ -121,15 +122,24 @@ VISIBLE_WHEEL_CLEARANCE_TARGET = 0.010 # 10 mm visible wheel clearance
 HIP_PRELOAD_DELTA  = +0.12 #+0.20         # rad, crouch hip target relative to standing pose.
 KNEE_PRELOAD_DELTA = -0.22 #-0.35         # rad, crouch knee target relative to standing pose.
 
-HIP_THRUST_DELTA   = -0.24 #-0.22           # rad, extension hip target relative to standing pose.
-KNEE_THRUST_DELTA  = +0.40 #+0.36          # rad, extension knee target relative to standing pose.
+HIP_THRUST_DELTA   = -0.27 #-0.26 #-0.24            # rad, extension hip target relative to standing pose.
+KNEE_THRUST_DELTA  = +0.44 #+0.42 #+0.40           # rad, extension knee target relative to standing pose.
 
-HIP_LAND_DELTA     = +0.10         # rad, landing absorption hip target relative to standing pose.
-KNEE_LAND_DELTA    = -0.25         # rad, landing absorption knee target relative to standing pose.
+HIP_LAND_DELTA     = +0.08 #+0.10         # rad, landing absorption hip target relative to standing pose.
+KNEE_LAND_DELTA    = -0.20 #-0.25         # rad, landing absorption knee target relative to standing pose.
 
 # Safety limits matching your XML ctrlrange for position actuators.
 HIP_CTRL_MIN, HIP_CTRL_MAX = -0.60, 0.60
 KNEE_CTRL_MIN, KNEE_CTRL_MAX = -0.80, 0.80
+
+# =========================================================
+# SETTLING TIME MEASUREMENT AFTER LANDING
+SETTLE_LEAN_ERR = math.radians(2.0) # This is a tolerance around the non-zero equilibrium angle
+SETTLE_RATE = math.radians(8.0) # CoM lean-rate limit
+SETTLE_VEL = 0.06 # Forward/backward wheel velocity limit.
+SETTLE_WHEEL = 0.08 # Wheel command should be small if the controller is no longer fighting
+SETTLE_HOLD = 0.30 # Robot must satisfy all conditions continuously for this long
+MAX_SETTLE_WAIT = 8.0 # Safety timeout so the simulation does not wait forever
 
 # =============================================================
 # LEG LOCK GAINS SPECIFICALLY FOR HIP AND KNEE "ACTUATOR-MOTOR"
@@ -317,10 +327,13 @@ def balance_gains_for_state(state):
         return K_THETA, 0.25, 0.18, 0.10 * K_X, MAX_WHEEL
     if state == STATE_FLIGHT:
         return K_THETA, 0.10, 0.00, 0.00, 0.10
-    if state == STATE_LANDING:
-        return K_THETA, 0.25, 0.18, 0.10 * K_X, MAX_WHEEL
-    if state == STATE_RECOVERY:
-        return K_THETA, 0.22, 0.18, 0.40 * K_X, MAX_WHEEL
+    elif state == STATE_LANDING:
+        # During landing, prioritise pitch damping.
+        # Do not aggressively recover x-position immediately after impact.
+        return K_THETA, 0.18, 0.10, 0.00, 0.22
+    elif state == STATE_RECOVERY:
+        # Gradually recover position after landing.
+        return K_THETA, 0.20, 0.12, 0.20 * K_X, 0.28
     return K_THETA, K_THETA_D, K_X_D, K_X, MAX_WHEEL
 
 
@@ -429,7 +442,6 @@ def run():  # Main function that loads the robot and runs the feedback loop.
     # Initial Hip and Knee reference positions from XML
     hip_ref_L = float(data.qpos[qadr["left_hip"]])
     hip_ref_R = float(data.qpos[qadr["right_hip"]])
-
     knee_ref_L = float(data.qpos[qadr["left_knee"]])
     knee_ref_R = float(data.qpos[qadr["right_knee"]])
 
@@ -503,6 +515,17 @@ def run():  # Main function that loads the robot and runs the feedback loop.
     hip_flight_hold_R = 0.0
     knee_flight_hold_L = 0.0
     knee_flight_hold_R = 0.0
+
+    # LANDING CONTINUITY VARIABLES
+    landing_start_hip_L = hip_ref_L
+    landing_start_hip_R = hip_ref_R
+    landing_start_knee_L = knee_ref_L
+    landing_start_knee_R = knee_ref_R
+
+    
+    # SETTLING TIME MEASUREMENT AFTER LANDING
+    settle_timer = 0.0
+    settle_time = None
 
 
     print(f"  SLOW_FACTOR  = {SLOW_FACTOR:.2f}  (edit this to change simulation speed)")  # Print simulation speed setting.
@@ -709,10 +732,32 @@ def run():  # Main function that loads the robot and runs the feedback loop.
                             - Kx   * (x - x_ref),
                             -max_wheel_state, max_wheel_state
                         )
-
+            
+            
             wheel_u = WHEEL_MOTOR_SIGN * wheel_u_raw
             data.ctrl[act_lwheel] = wheel_u
             data.ctrl[act_rwheel] = wheel_u
+
+            wheel_sat = abs(wheel_u) >= 0.98 * max_wheel_state
+
+            # =========================================================
+            # SETTLING TIME CHECK
+            # =========================================================
+            settled_now = False
+
+            if landing_time is not None:
+                settled_now = (
+                    loaded_state
+                    and abs(theta - PITCH_OFFSET) < SETTLE_LEAN_ERR
+                    and abs(theta_dot) < SETTLE_RATE
+                    and abs(xdot) < SETTLE_VEL
+                    and abs(wheel_u) < SETTLE_WHEEL
+                )
+
+                if settled_now:
+                    settle_timer += dt
+                else:
+                    settle_timer = 0.0
 
             # ============================================================================================================
             # JUMP STATE MACHINE + HIP/KNEE TARGET GENERATION
@@ -794,6 +839,10 @@ def run():  # Main function that loads the robot and runs the feedback loop.
                     jump_height_above_stand_air = 0.0
                     v_takeoff_from_air = 0.0
                     flight_time = 0.0
+
+                    # Settling time measurement after landing is reset at the start of the jump attempt.
+                    settle_timer = 0.0
+                    settle_time = None
 
                     print(
                         f"\n>>> JUMP STATE: PRELOAD "
@@ -893,6 +942,12 @@ def run():  # Main function that loads the robot and runs the feedback loop.
                 landing_detected = loaded_state
 
                 if landing_detected:
+                    # Capture actual pose before entering LANDING
+                    landing_start_hip_L = float(data.qpos[qadr["left_hip"]])
+                    landing_start_hip_R = float(data.qpos[qadr["right_hip"]])
+                    landing_start_knee_L = float(data.qpos[qadr["left_knee"]])
+                    landing_start_knee_R = float(data.qpos[qadr["right_knee"]])
+
                     jump_state = STATE_LANDING
                     state_t0 = data.time
 
@@ -949,8 +1004,23 @@ def run():  # Main function that loads the robot and runs the feedback loop.
             elif jump_state == STATE_RECOVERY:
                 if elapsed >= T_RECOVERY:
 
+                    jump_state = STATE_SETTLE
+                    state_t0 = data.time
+
+                    print("\n>>> JUMP STATE: SETTLE / WAITING FOR STABLE BALANCE")
+
+            # ============================================================================================================
+            elif jump_state == STATE_SETTLE:
+
+                # Wait until the robot is truly balanced after landing.
+                if settle_time is None and settle_timer >= SETTLE_HOLD:
+                    settle_time = data.time - landing_time
+
+                settle_timeout = elapsed >= MAX_SETTLE_WAIT
+
+                if settle_time is not None or settle_timeout:
+
                     # Final full-attempt measurements.
-                    # These are calculated at the end, after landing/recovery has allowed peak_com_z to update.
                     if stand_com_z is not None and np.isfinite(peak_com_z):
                         jump_height_total = max(0.0, peak_com_z - stand_com_z)
                     else:
@@ -961,11 +1031,16 @@ def run():  # Main function that loads the robot and runs the feedback loop.
                     else:
                         jump_height_from_crouch = 0.0
 
+                    visible_jump = (
+                        peak_gap_abs >= 0.010
+                        and jump_height_above_stand_air >= 0.010
+                    )
+
                     jump_state = STATE_BALANCE
                     state_t0 = data.time
                     jump_done = JUMP_ONCE
 
-                    print("\n>>> JUMP STATE: BALANCE / RECOVERED")
+                    print("\n>>> JUMP STATE: BALANCE / SETTLED")
                     print(
                         f">>> FINAL JUMP SUMMARY "
                         f"FlightTime={flight_time:.4f}s "
@@ -978,7 +1053,10 @@ def run():  # Main function that loads the robot and runs the feedback loop.
                         f"PreloadMinZ={preload_min_com_z:.4f} "
                         f"PeakZ={peak_com_z:.4f} "
                         f"Vto_air_est={v_takeoff_from_air:.4f}m/s "
-                        f"Favg_thrust={average_thrust_force:.2f}N"
+                        f"Favg_thrust={average_thrust_force:.2f}N "
+                        f"SettleTime={0.0 if settle_time is None else settle_time:.4f}s "
+                        f"TimedOut={int(settle_timeout)} "
+                        f"SUCCESS_VISIBLE={int(visible_jump)} "
                     )
 
             elapsed = data.time - state_t0
@@ -986,7 +1064,7 @@ def run():  # Main function that loads the robot and runs the feedback loop.
             # -----------------------------
             # Leg target generation for each state
             # -----------------------------
-            if jump_state == STATE_BALANCE:
+            if jump_state in [STATE_BALANCE, STATE_SETTLE]:
                 hip_target_L = hip_stand_L
                 hip_target_R = hip_stand_R
                 knee_target_L = knee_stand_L
@@ -1020,10 +1098,14 @@ def run():  # Main function that loads the robot and runs the feedback loop.
 
             elif jump_state == STATE_LANDING:
                 a = smoothstep01(elapsed, T_LANDING)
-                hip_target_L = blend(hip_thrust_L, hip_land_L, a)
-                hip_target_R = blend(hip_thrust_R, hip_land_R, a)
-                knee_target_L = blend(knee_thrust_L, knee_land_L, a)
-                knee_target_R = blend(knee_thrust_R, knee_land_R, a)
+
+                # Start landing recovery from the actual leg pose at touchdown.
+                # This avoids a sudden jump from flight pose to thrust pose.
+                hip_target_L = blend(landing_start_hip_L, hip_land_L, a)
+                hip_target_R = blend(landing_start_hip_R, hip_land_R, a)
+
+                knee_target_L = blend(landing_start_knee_L, knee_land_L, a)
+                knee_target_R = blend(landing_start_knee_R, knee_land_R, a)
 
             elif jump_state == STATE_RECOVERY:
                 a = smoothstep01(elapsed, T_RECOVERY)
@@ -1090,14 +1172,16 @@ def run():  # Main function that loads the robot and runs the feedback loop.
                 print_every = max(1, int(PRINT_DT_JUMP / dt))
 
             if step % print_every == 0:  # During balance: print every 0.50 s; During jump: print every 0.02 s
-                if abs(wheel_u) >= MAX_WHEEL * 0.98:  # Check whether wheel command is saturating.
-                    status = "SATURATED / reduce gain"  # Explain that gains may be too high.
-                elif abs(theta - theta_ref) < 0.035 and abs(xdot) < 0.08:  # Check if balance and speed are both close to zero.
-                    status = "BALANCING"  # Report good standing balance.
-                elif abs(xdot) > 1.0:  # Check if robot is running away.
-                    status = "FAST MOTION"  # Tell user the likely fix.
-                else:  # Otherwise the controller is still correcting.
-                    status = "correcting"  # Report normal recovery behavior.
+                if wheel_sat:
+                    status = "WHEEL_SAT / reduce wheel gain"
+                elif leg_sat:
+                    status = "LEG_SAT / soften landing or raise force"
+                elif abs(theta - theta_ref) < 0.035 and abs(xdot) < 0.08:
+                    status = "BALANCING"
+                elif abs(xdot) > 1.0:
+                    status = "FAST MOTION"
+                else:
+                    status = "correcting"
                 print(
                         f"{data.time:6.2f} "
                         f"{math.degrees(pitch):+8.2f} "
@@ -1127,6 +1211,7 @@ def run():  # Main function that loads the robot and runs the feedback loop.
                         f"PeakZ={peak_com_z:+6.3f} "
                         f"TauH={hip_tau_L:+6.1f} "
                         f"TauK={knee_tau_L:+6.1f} "
+                        f"WheelSat={int(wheel_sat)} "
                         f"LegSat={int(leg_sat)} "
                         f"ThrA={thrust_alpha_now:4.2f} "
                         f"Hq={hip_q_L:+5.2f} Kq={knee_q_L:+5.2f} "
