@@ -886,6 +886,13 @@ def run():  # Main function that loads the robot and runs the feedback loop.
                     settle_time = None
                     settle_failed = False
 
+                    # WHEEL AND LEG SATURATION TRACKING RESET
+                    wheel_sat_count = 0
+                    leg_sat_count = 0
+                    max_abs_wheel_u = 0.0
+                    max_abs_xdot_after_landing = 0.0
+                    max_abs_theta_dot_after_landing = 0.0
+
                     print(
                         f"\n>>> JUMP STATE: PRELOAD "
                         f"t={data.time:.4f}s "
@@ -1122,9 +1129,14 @@ def run():  # Main function that loads the robot and runs the feedback loop.
                         f"PeakZ={peak_com_z:.4f} "
                         f"Vto_air_est={v_takeoff_from_air:.4f}m/s "
                         f"Favg_thrust={average_thrust_force:.2f}N "
-                        f"SettleTime={settle_time_text} "
+                        #f"SettleTime={settle_time_text} "
                         f"SettleTimeNum={settle_time_numeric:.4f} "
                         f"TimedOut={int(settle_failed)} "
+                        f"WheelSatCount={wheel_sat_count} "
+                        f"LegSatCount={leg_sat_count} "
+                        f"MaxWheelU={max_abs_wheel_u:.3f} "
+                        f"MaxPostLandVel={max_abs_xdot_after_landing:.3f} "
+                        f"MaxPostLandRate={math.degrees(max_abs_theta_dot_after_landing):.1f}deg/s "
                         f"SUCCESS_VISIBLE={int(visible_jump)} "
                     )
 
@@ -1228,6 +1240,19 @@ def run():  # Main function that loads the robot and runs the feedback loop.
                 abs(knee_tau_L) > 0.98 * LEG_FORCE_LIMIT or
                 abs(knee_tau_R) > 0.98 * LEG_FORCE_LIMIT
             )
+
+            # =========================================================
+            # WHEEL AND LEG SATURATION TRACKING
+            if jump_state in [STATE_LANDING, STATE_RECOVERY, STATE_SETTLE]:
+                if wheel_sat:
+                    wheel_sat_count += 1
+
+                if leg_sat:
+                    leg_sat_count += 1
+
+                max_abs_wheel_u = max(max_abs_wheel_u, abs(wheel_u))
+                max_abs_xdot_after_landing = max(max_abs_xdot_after_landing, abs(xdot))
+                max_abs_theta_dot_after_landing = max(max_abs_theta_dot_after_landing, abs(theta_dot))
             # ==================================================================================================================================
                 
                 
