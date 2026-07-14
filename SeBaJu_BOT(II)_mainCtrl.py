@@ -144,10 +144,10 @@ KNEE_CTRL_MIN, KNEE_CTRL_MAX = -0.80, 0.80
 # SETTLING TIME MEASUREMENT AFTER LANDING
 SETTLE_LEAN_ERR = math.radians(2.0) # This is a tolerance around the non-zero equilibrium angle
 SETTLE_RATE = math.radians(8.0) # CoM lean-rate limit
-SETTLE_VEL = 0.06 # Forward/backward wheel velocity limit.
-SETTLE_WHEEL = 0.08 # Wheel command should be small if the controller is no longer fighting
+SETTLE_VEL = 0.04 # Forward/backward wheel velocity limit.
+SETTLE_WHEEL = 0.06 # Wheel command should be small if the controller is no longer fighting
 SETTLE_HOLD = 0.30 # Robot must satisfy all conditions continuously for this long
-MAX_SETTLE_WAIT = 8.0 # Safety timeout so the simulation does not wait forever
+MAX_SETTLE_WAIT = 12.0 # Safety timeout so the simulation does not wait forever
 
 # =============================================================
 # LEG LOCK GAINS SPECIFICALLY FOR HIP AND KNEE "ACTUATOR-MOTOR"
@@ -342,6 +342,9 @@ def balance_gains_for_state(state):
     elif state == STATE_RECOVERY:
         # Gradually recover position after landing.
         return K_THETA, 0.20, 0.12, 0.20 * K_X, 0.28
+    elif state == STATE_SETTLE:
+        # Settling: restore more normal balance but avoid aggressive position pull.
+        return K_THETA, K_THETA_D, 0.22, 0.15 * K_X, MAX_WHEEL
     return K_THETA, K_THETA_D, K_X_D, K_X, MAX_WHEEL
 
 
@@ -534,6 +537,7 @@ def run():  # Main function that loads the robot and runs the feedback loop.
     # SETTLING TIME MEASUREMENT AFTER LANDING
     settle_timer = 0.0
     settle_time = None
+    settle_failed = False
 
 
     print(f"  SLOW_FACTOR  = {SLOW_FACTOR:.2f}  (edit this to change simulation speed)")  # Print simulation speed setting.
@@ -753,19 +757,25 @@ def run():  # Main function that loads the robot and runs the feedback loop.
             # =========================================================
             settled_now = False
 
-            if landing_time is not None:
+            if landing_time is not None and jump_state in [STATE_RECOVERY, STATE_SETTLE, STATE_BALANCE]:
+
+                #x_settle_error = x - x_ref_active
+
                 settled_now = (
                     loaded_state
                     and abs(theta - PITCH_OFFSET) < SETTLE_LEAN_ERR
                     and abs(theta_dot) < SETTLE_RATE
                     and abs(xdot) < SETTLE_VEL
                     and abs(wheel_u) < SETTLE_WHEEL
+                    #and abs(x_settle_error) < SETTLE_X_ERR
                 )
 
                 if settled_now:
                     settle_timer += dt
                 else:
                     settle_timer = 0.0
+            else:
+                settle_timer = 0.0
 
             # ============================================================================================================
             # JUMP STATE MACHINE + HIP/KNEE TARGET GENERATION
@@ -851,6 +861,7 @@ def run():  # Main function that loads the robot and runs the feedback loop.
                     # Settling time measurement after landing is reset at the start of the jump attempt.
                     settle_timer = 0.0
                     settle_time = None
+                    settle_failed = False
 
                     print(
                         f"\n>>> JUMP STATE: PRELOAD "
@@ -962,6 +973,11 @@ def run():  # Main function that loads the robot and runs the feedback loop.
                     landing_time = data.time
                     landing_com_z = com_z
 
+                    # Reset settling measurement at landing.
+                    settle_timer = 0.0
+                    settle_time = None
+                    settle_failed = False
+
                     if takeoff_time is not None:
                         flight_time = landing_time - takeoff_time
                     else:
@@ -1020,13 +1036,19 @@ def run():  # Main function that loads the robot and runs the feedback loop.
             # ============================================================================================================
             elif jump_state == STATE_SETTLE:
 
-                # Wait until the robot is truly balanced after landing.
+                # Success: robot has satisfied settling conditions continuously.
                 if settle_time is None and settle_timer >= SETTLE_HOLD:
                     settle_time = data.time - landing_time
 
-                settle_timeout = elapsed >= MAX_SETTLE_WAIT
+                # Timeout should be measured from landing, not from the start of SETTLE.
+                settle_timeout = (
+                    landing_time is not None
+                    and (data.time - landing_time) >= MAX_SETTLE_WAIT
+                )
 
                 if settle_time is not None or settle_timeout:
+
+                    settle_failed = settle_time is None
 
                     # Final full-attempt measurements.
                     if stand_com_z is not None and np.isfinite(peak_com_z):
@@ -1048,6 +1070,13 @@ def run():  # Main function that loads the robot and runs the feedback loop.
                     state_t0 = data.time
                     jump_done = JUMP_ONCE
 
+                    if settle_failed:
+                        settle_time_text = "NOT_SETTLED"
+                        settle_time_numeric = -1.0
+                    else:
+                        settle_time_text = f"{settle_time:.4f}s"
+                        settle_time_numeric = settle_time
+
                     print("\n>>> JUMP STATE: BALANCE / SETTLED")
                     print(
                         f">>> FINAL JUMP SUMMARY "
@@ -1062,8 +1091,9 @@ def run():  # Main function that loads the robot and runs the feedback loop.
                         f"PeakZ={peak_com_z:.4f} "
                         f"Vto_air_est={v_takeoff_from_air:.4f}m/s "
                         f"Favg_thrust={average_thrust_force:.2f}N "
-                        f"SettleTime={0.0 if settle_time is None else settle_time:.4f}s "
-                        f"TimedOut={int(settle_timeout)} "
+                        f"SettleTime={settle_time_text} "
+                        f"SettleTimeNum={settle_time_numeric:.4f} "
+                        f"TimedOut={int(settle_failed)} "
                         f"SUCCESS_VISIBLE={int(visible_jump)} "
                     )
 
