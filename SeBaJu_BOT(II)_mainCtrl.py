@@ -146,8 +146,15 @@ SETTLE_LEAN_ERR = math.radians(2.0) # This is a tolerance around the non-zero eq
 SETTLE_RATE = math.radians(8.0) # CoM lean-rate limit
 SETTLE_VEL = 0.04 # Forward/backward wheel velocity limit.
 SETTLE_WHEEL = 0.06 # Wheel command should be small if the controller is no longer fighting
+SETTLE_X_ERR = 0.015 # Position error relative to landing location
 SETTLE_HOLD = 0.30 # Robot must satisfy all conditions continuously for this long
 MAX_SETTLE_WAIT = 12.0 # Safety timeout so the simulation does not wait forever
+
+# =========================================================
+# LANDING POSITION REFERENCE
+# False means: balance where the robot lands.
+# True means: after landing, try to return to the original start position.
+RETURN_TO_START_AFTER_JUMP = False
 
 # =============================================================
 # LEG LOCK GAINS SPECIFICALLY FOR HIP AND KNEE "ACTUATOR-MOTOR"
@@ -539,6 +546,17 @@ def run():  # Main function that loads the robot and runs the feedback loop.
     settle_time = None
     settle_failed = False
 
+    # LANDING POSITION REFERENCE
+    landing_x_ref = 0.0
+    x_ref_active = 0.0
+
+    # WHEEL AND LEG SATURATION TRACKING
+    wheel_sat_count = 0
+    leg_sat_count = 0
+    max_abs_wheel_u = 0.0
+    max_abs_xdot_after_landing = 0.0
+    max_abs_theta_dot_after_landing = 0.0
+
 
     print(f"  SLOW_FACTOR  = {SLOW_FACTOR:.2f}  (edit this to change simulation speed)")  # Print simulation speed setting.
     print("-" * 100)  # Print separator line.
@@ -733,7 +751,12 @@ def run():  # Main function that loads the robot and runs the feedback loop.
             # JUMP STAGE-AWARE DIRECT STATE-FEEDBACK BALANCER
             # =====================================================
             theta_ref = PITCH_OFFSET
-            x_ref = 0.0
+            
+            if jump_state in [STATE_LANDING, STATE_RECOVERY, STATE_SETTLE]:
+                x_ref = x_ref_active
+            else:
+                x_ref = 0.0
+            # ---------------------------------------------------------
 
             Kth, Kthd, Kxd, Kx, max_wheel_state = balance_gains_for_state(jump_state)
 
@@ -759,7 +782,7 @@ def run():  # Main function that loads the robot and runs the feedback loop.
 
             if landing_time is not None and jump_state in [STATE_RECOVERY, STATE_SETTLE, STATE_BALANCE]:
 
-                #x_settle_error = x - x_ref_active
+                x_settle_error = x - x_ref_active
 
                 settled_now = (
                     loaded_state
@@ -767,7 +790,7 @@ def run():  # Main function that loads the robot and runs the feedback loop.
                     and abs(theta_dot) < SETTLE_RATE
                     and abs(xdot) < SETTLE_VEL
                     and abs(wheel_u) < SETTLE_WHEEL
-                    #and abs(x_settle_error) < SETTLE_X_ERR
+                    and abs(x_settle_error) < SETTLE_X_ERR
                 )
 
                 if settled_now:
@@ -972,6 +995,14 @@ def run():  # Main function that loads the robot and runs the feedback loop.
 
                     landing_time = data.time
                     landing_com_z = com_z
+
+                    # Capture where the robot landed.
+                    landing_x_ref = x
+
+                    if RETURN_TO_START_AFTER_JUMP:
+                        x_ref_active = 0.0
+                    else:
+                        x_ref_active = landing_x_ref
 
                     # Reset settling measurement at landing.
                     settle_timer = 0.0
