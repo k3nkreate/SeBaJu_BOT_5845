@@ -752,8 +752,12 @@ def run():  # Main function that loads the robot and runs the feedback loop.
             # =====================================================
             theta_ref = PITCH_OFFSET
             
-            if jump_state in [STATE_LANDING, STATE_RECOVERY, STATE_SETTLE, STATE_BALANCE]:
+            if jump_state in [STATE_LANDING, STATE_RECOVERY, STATE_SETTLE]:
                 x_ref = x_ref_active
+
+            elif jump_state == STATE_BALANCE and jump_done:
+                x_ref = x_ref_active
+
             else:
                 x_ref = 0.0
             # ---------------------------------------------------------
