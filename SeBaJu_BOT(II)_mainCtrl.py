@@ -60,12 +60,31 @@ WHEEL_MOTOR_SIGN = -1
 # LEG_ACTUATOR_MODE = "motor_pd"
 LEG_ACTUATOR_MODE = "position_servo"
 
+# =========================================================
+# =========================================================
+# EXPERIMENT SELECTOR
+# =========================================================
+EXPERIMENT_MODE = "SLANT_RIGHT"  # Choose one of the following experiment modes.
+# Options:
+# "BASE_JUMP"
+# "INDIVIDUAL_LEG_TEST"
+# "SLANT_LEFT"
+# "SLANT_RIGHT"
+# "ROLL_FORWARD"
+# "ROLL_BACKWARD"
+# "STEP_LEFT"
+# "STEP_RIGHT"
+# "JUMP_FORWARD"
+# "JUMP_BACKWARD"
+# =========================================================
+
 #===========================================================================================
 # JUMP TEST
-JUMP_ENABLE = True
+JUMP_ENABLE = JUMP_ENABLE = EXPERIMENT_MODE in ["BASE_JUMP", "JUMP_FORWARD", "JUMP_BACKWARD"]
 JUMP_START_TIME = 5.0
 JUMP_ONCE = True
 
+# JUMP STATE MACHINE STATES
 STATE_BALANCE = "BALANCE"
 STATE_PRELOAD = "PRELOAD"
 STATE_THRUST = "THRUST"
@@ -73,6 +92,26 @@ STATE_FLIGHT = "FLIGHT"
 STATE_LANDING = "LANDING"
 STATE_RECOVERY = "RECOVERY"
 STATE_SETTLE = "SETTLE"
+
+# =========================================================
+# HIGH-LEVEL MOTION MODES
+# =========================================================
+MODE_NONE = "NONE"
+MODE_INDIVIDUAL_LEG = "INDIVIDUAL_LEG"
+MODE_SLANT = "SLANT"
+MODE_ROLL_MOVE = "ROLL_MOVE"
+MODE_STEP = "STEP"
+MODE_JUMP_X = "JUMP_X"
+
+# =========================================================
+# STEP SUB-STATES
+# =========================================================
+STEP_IDLE = "STEP_IDLE"
+STEP_PREP = "STEP_PREP"
+STEP_UNLOAD = "STEP_UNLOAD"
+STEP_SWING = "STEP_SWING"
+STEP_PLACE = "STEP_PLACE"
+STEP_TRANSFER = "STEP_TRANSFER"
 
 # JUMP TIMING AND DETECTION SETTINGS
 T_PRELOAD = 0.80                   # Slow crouch time, seconds.
@@ -140,6 +179,7 @@ KNEE_LAND_DELTA    = -0.20 #-0.25         # rad, landing absorption knee target 
 HIP_CTRL_MIN, HIP_CTRL_MAX = -0.60, 0.60
 KNEE_CTRL_MIN, KNEE_CTRL_MAX = -0.80, 0.80
 
+
 # =========================================================
 # SETTLING TIME MEASUREMENT AFTER LANDING
 SETTLE_LEAN_ERR = math.radians(2.0) # This is a tolerance around the non-zero equilibrium angle
@@ -156,8 +196,58 @@ MAX_SETTLE_WAIT = 12.0 # Safety timeout so the simulation does not wait forever
 # True means: after landing, try to return to the original start position.
 RETURN_TO_START_AFTER_JUMP = False
 
+# =========================================================
+# ROLL / SIDE-SLANT CONTROL
+# =========================================================
+ROLL_REF_MAX = math.radians(6.0)
+ROLL_SAFETY_MAX = math.radians(10.0)
+
+K_ROLL_P = 0.70
+K_ROLL_D = 0.08
+
+HIP_ROLL_TO_DIFF = 0.14
+KNEE_ROLL_TO_DIFF = 0.20
+LEG_DIFF_MAX = 0.22
+
+# =========================================================
+# POINT-TO-POINT ROLLING
+# =========================================================
+X_CMD_RATE = 0.10 #0.20          # m/s reference movement speed
+X_GOAL_TOL = 0.015         # m
+X_I_MAX = 0.08
+K_X_I = 0.10
+
+# =========================================================
+# STEPPING TEST
+# =========================================================
+STEP_PREP_TIME = 0.35
+STEP_UNLOAD_TIME = 0.35
+STEP_SWING_TIME = 0.45
+STEP_PLACE_TIME = 0.30
+STEP_TRANSFER_TIME = 0.40
+
+STEP_ROLL_BIAS = math.radians(4.0)
+
+STEP_HIP_LIFT = +0.10
+STEP_KNEE_LIFT = -0.20
+STEP_HIP_SWING = -0.10
+STEP_KNEE_SWING = +0.08
+
+# =========================================================
+# TRANSLATIONAL JUMP
+# =========================================================
+JUMP_X_PITCH_BIAS = math.radians(1.8)
+JUMP_X_WHEEL_FF = 0.08
+JUMP_X_MAX = 0.18
+
+# =========================================================
+# COMMAND SLEW LIMITS
+# =========================================================
+LEG_DQ_MAX = 0.020
+WHEEL_DU_MAX = 0.020
+
 # =============================================================
-# LEG LOCK GAINS SPECIFICALLY FOR HIP AND KNEE "ACTUATOR-MOTOR"
+# LEG LOCK GAINS SPECIFICALLY FOR HIP AND KNEE "ACTUATOR-MOTOR" [OPTIONAL]
 # =============================================================
 HIP_KP = 75.0
 HIP_KD = 7.5
@@ -174,7 +264,6 @@ MAX_KNEE = 1.0
 HIP_MOTOR_SIGN = 1.0
 KNEE_MOTOR_SIGN = 1.0
 # ===============================================================
-
 
 #=====================================================================================================
 # HELPER FUNCTIONS
@@ -355,6 +444,58 @@ def balance_gains_for_state(state):
     return K_THETA, K_THETA_D, K_X_D, K_X, MAX_WHEEL
 
 
+def quat_to_roll_pitch(qw, qx, qy, qz):
+    """
+    Convert quaternion to roll and pitch.
+    Roll is needed for side-slant control.
+    """
+    sinr_cosp = 2.0 * (qw * qx + qy * qz)
+    cosr_cosp = 1.0 - 2.0 * (qx * qx + qy * qy)
+    roll = math.atan2(sinr_cosp, cosr_cosp)
+
+    sinp = 2.0 * (qw * qy - qz * qx)
+    pitch = math.asin(clamp(sinp, -1.0, 1.0))
+
+    return roll, pitch
+
+
+def slew(target, previous, step_max):
+    """
+    Limit how fast a command can change.
+    This prevents sudden leg or wheel commands.
+    """
+    change = clamp(target - previous, -step_max, +step_max)
+    return previous + change
+
+
+def leg_common_diff_to_targets(hip_common, knee_common, hip_diff, knee_diff):
+    """
+    Convert common + differential leg commands into left/right targets.
+
+    Common command affects both legs equally.
+    Differential command makes the two legs move differently.
+    """
+    hip_L = hip_common + hip_diff
+    hip_R = hip_common - hip_diff
+
+    knee_L = knee_common - knee_diff
+    knee_R = knee_common + knee_diff
+
+    return hip_L, hip_R, knee_L, knee_R
+
+
+def swing_profile01(t, T):
+    """
+    Smooth swing profile for one-leg stepping.
+    prog moves from 0 to 1.
+    lift goes 0 -> 1 -> 0.
+    """
+    s = smoothstep01(t, T)
+    prog = 0.5 - 0.5 * math.cos(math.pi * s)
+    lift = math.sin(math.pi * s)
+    return prog, lift
+
+
 
 #============================================================================================================================================
 # MAIN FUNCTION
@@ -382,6 +523,7 @@ def run():  # Main function that loads the robot and runs the feedback loop.
     print(f"  Robot weight = {robot_weight:.3f} N")
     print(f"  Contact OFF threshold = {F_CONTACT_OFF:.3f} N")
     print(f"  Contact ON threshold  = {F_CONTACT_ON:.3f} N")
+    print(f"  EXPERIMENT_MODE = {EXPERIMENT_MODE}")
 
     #This block needs to be changed
     key_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "stand")  # Look for the standing keyframe in the XML.
@@ -550,6 +692,33 @@ def run():  # Main function that loads the robot and runs the feedback loop.
     landing_x_ref = 0.0
     x_ref_active = 0.0
 
+        # =========================================================
+    # HIGH-LEVEL MOTION VARIABLES
+    # =========================================================
+    motion_mode = MODE_NONE
+    motion_started = False
+    motion_t0 = 0.0
+
+    x_goal = 0.0
+    x_cmd = 0.0
+    x_i = 0.0
+
+    slant_ref = 0.0
+
+    step_phase = STEP_IDLE
+    step_side = "L"
+    step_dir = +1.0
+
+    jump_direction = 0.0
+    launch_x_ref = 0.0
+
+    prev_wheel_u = 0.0
+
+    prev_hip_L_cmd = hip_ref_L
+    prev_hip_R_cmd = hip_ref_R
+    prev_knee_L_cmd = knee_ref_L
+    prev_knee_R_cmd = knee_ref_R
+
     # WHEEL AND LEG SATURATION TRACKING
     wheel_sat_count = 0
     leg_sat_count = 0
@@ -578,6 +747,19 @@ def run():  # Main function that loads the robot and runs the feedback loop.
             imu_a = sensor_data(model, data, "imu_accel")  # Read IMU acceleration; corrected below using IMU-to-CoM offset.
             imu_pos = sensor_data(model, data, "imu_pos") # Read IMU position
             com = sensor_data(model, data, "robot_com")  # Read whole-robot center of mass.
+
+            # =========================================================
+            # ROLL ESTIMATION FOR SIDE-SLANT AND LEG ASYMMETRY
+            # =========================================================
+            roll, pitch_quat_full = quat_to_roll_pitch(
+                imu_q[0], imu_q[1], imu_q[2], imu_q[3]
+            )
+
+            roll_rate = float(imu_g[0])
+
+            if abs(roll) > ROLL_SAFETY_MAX:
+                motion_mode = MODE_NONE
+                step_phase = STEP_IDLE
             
             # -------------------------------------------------
             # Vertical CoM velocity for jump monitoring
@@ -752,31 +934,81 @@ def run():  # Main function that loads the robot and runs the feedback loop.
             # =====================================================
             theta_ref = PITCH_OFFSET
             
-            if jump_state in [STATE_LANDING, STATE_RECOVERY, STATE_SETTLE]:
+            # =========================================================
+            # MODE-AWARE X REFERENCE
+            # =========================================================
+            if motion_mode == MODE_ROLL_MOVE and jump_state == STATE_BALANCE:
+                x_cmd = slew(x_goal, x_cmd, X_CMD_RATE * dt)
+                x_ref = x_cmd
+
+            elif jump_state in [STATE_LANDING, STATE_RECOVERY, STATE_SETTLE]:
                 x_ref = x_ref_active
 
             elif jump_state == STATE_BALANCE and jump_done:
                 x_ref = x_ref_active
 
+            elif motion_mode == MODE_JUMP_X and jump_state in [STATE_PRELOAD, STATE_THRUST]:
+                x_ref = launch_x_ref
+
             else:
                 x_ref = 0.0
             # ---------------------------------------------------------
 
+            # =========================================================
+            # SMALL INTEGRAL ONLY FOR POINT-TO-POINT ROLLING
+            # =========================================================
+            if motion_mode == MODE_ROLL_MOVE and jump_state == STATE_BALANCE:
+                x_i = clamp(x_i + (x_ref - x) * dt, -X_I_MAX, +X_I_MAX)
+            else:
+                x_i *= 0.98
+            # --------------------------------------------------------
+
+            # =========================================================
+            # BALANCE GAINS FOR CURRENT JUMP STATE
+            # =========================================================
             Kth, Kthd, Kxd, Kx, max_wheel_state = balance_gains_for_state(jump_state)
 
-            wheel_u_raw = clamp(
-                            Kth   * (theta - theta_ref)
-                            + Kthd * theta_dot
-                            - Kxd  * xdot
-                            - Kx   * (x - x_ref),
-                            -max_wheel_state, max_wheel_state
-                        )
-            
-            
-            wheel_u = WHEEL_MOTOR_SIGN * wheel_u_raw
+            # =========================================================
+            # MODE-AWARE WHEEL CONTROL
+            # =========================================================
+            theta_ref_local = theta_ref
+            wheel_ff = 0.0
+
+            # For translational jump, lean slightly in desired direction.
+            if motion_mode == MODE_JUMP_X and jump_state in [STATE_PRELOAD, STATE_THRUST]:
+                theta_ref_local = theta_ref + jump_direction * JUMP_X_PITCH_BIAS
+
+                if jump_state == STATE_PRELOAD:
+                    a_ff = smoothstep01(elapsed, T_PRELOAD)
+                else:
+                    a_ff = fast_thrust01(elapsed, T_THRUST)
+
+                wheel_ff = jump_direction * JUMP_X_WHEEL_FF * a_ff
+
+            wheel_u_unsat = (
+                Kth   * (theta - theta_ref_local)
+                + Kthd * theta_dot
+                - Kxd  * xdot
+                - Kx   * (x - x_ref)
+                - K_X_I * x_i
+                + wheel_ff
+            )
+
+            wheel_u_target = WHEEL_MOTOR_SIGN * clamp(
+                wheel_u_unsat,
+                -max_wheel_state,
+                +max_wheel_state
+            )
+
+            wheel_u = slew(wheel_u_target, prev_wheel_u, WHEEL_DU_MAX)
+            prev_wheel_u = wheel_u
+
             data.ctrl[act_lwheel] = wheel_u
             data.ctrl[act_rwheel] = wheel_u
 
+            # =========================================================
+            # WHEEL SATURATION CHECK
+            # =========================================================
             wheel_sat = abs(wheel_u) >= 0.98 * max_wheel_state
 
             # =========================================================
@@ -837,6 +1069,81 @@ def run():  # Main function that loads the robot and runs the feedback loop.
                 and abs(xdot) < 0.08
                 and loaded_state
             )
+
+            # =========================================================
+            # ARM SELECTED EXPERIMENT ONCE ROBOT IS STABLE
+            # =========================================================
+            stable_for_motion = (
+                jump_state == STATE_BALANCE
+                and not motion_started
+                and data.time > 5.0
+                and abs(theta - theta_ref) < math.radians(2.5)
+                and abs(xdot) < 0.08
+                and loaded_state
+            )
+
+            if stable_for_motion:
+
+                if EXPERIMENT_MODE == "INDIVIDUAL_LEG_TEST":
+                    motion_mode = MODE_INDIVIDUAL_LEG
+                    motion_t0 = data.time
+                    motion_started = True
+
+                elif EXPERIMENT_MODE == "SLANT_LEFT":
+                    motion_mode = MODE_SLANT
+                    slant_ref = +math.radians(4.0)
+                    motion_t0 = data.time
+                    motion_started = True
+
+                elif EXPERIMENT_MODE == "SLANT_RIGHT":
+                    motion_mode = MODE_SLANT
+                    slant_ref = -math.radians(4.0)
+                    motion_t0 = data.time
+                    motion_started = True
+
+                elif EXPERIMENT_MODE == "ROLL_FORWARD":
+                    motion_mode = MODE_ROLL_MOVE
+                    x_goal = x + 0.20
+                    x_cmd = x
+                    motion_t0 = data.time
+                    motion_started = True
+
+                elif EXPERIMENT_MODE == "ROLL_BACKWARD":
+                    motion_mode = MODE_ROLL_MOVE
+                    x_goal = x - 0.20
+                    x_cmd = x
+                    motion_t0 = data.time
+                    motion_started = True
+
+                elif EXPERIMENT_MODE == "STEP_LEFT":
+                    motion_mode = MODE_STEP
+                    step_side = "L"
+                    step_dir = +1.0
+                    step_phase = STEP_PREP
+                    motion_t0 = data.time
+                    motion_started = True
+
+                elif EXPERIMENT_MODE == "STEP_RIGHT":
+                    motion_mode = MODE_STEP
+                    step_side = "R"
+                    step_dir = +1.0
+                    step_phase = STEP_PREP
+                    motion_t0 = data.time
+                    motion_started = True
+
+                elif EXPERIMENT_MODE == "JUMP_FORWARD":
+                    motion_mode = MODE_JUMP_X
+                    jump_direction = +1.0
+                    launch_x_ref = x
+                    motion_t0 = data.time
+                    motion_started = True
+
+                elif EXPERIMENT_MODE == "JUMP_BACKWARD":
+                    motion_mode = MODE_JUMP_X
+                    jump_direction = -1.0
+                    launch_x_ref = x
+                    motion_t0 = data.time
+                    motion_started = True
 
             elapsed = data.time - state_t0
 
@@ -1146,6 +1453,65 @@ def run():  # Main function that loads the robot and runs the feedback loop.
 
             elapsed = data.time - state_t0
 
+            # =========================================================
+            # STEP SUB-STATE MACHINE
+            # Only active during normal BALANCE, not during jump.
+            # =========================================================
+            if motion_mode == MODE_STEP and jump_state == STATE_BALANCE:
+
+                step_elapsed = data.time - motion_t0
+
+                if step_side == "L":
+                    swing_fn = left_fn
+                    support_fn = right_fn
+                else:
+                    swing_fn = right_fn
+                    support_fn = left_fn
+
+                if step_phase == STEP_PREP:
+                    if step_elapsed >= STEP_PREP_TIME:
+                        step_phase = STEP_UNLOAD
+                        motion_t0 = data.time
+
+                elif step_phase == STEP_UNLOAD:
+                    if step_elapsed >= STEP_UNLOAD_TIME or swing_fn < STEP_UNLOAD_FN_MAX:
+                        step_phase = STEP_SWING
+                        motion_t0 = data.time
+
+                elif step_phase == STEP_SWING:
+                    if step_elapsed >= STEP_SWING_TIME:
+                        step_phase = STEP_PLACE
+                        motion_t0 = data.time
+
+                elif step_phase == STEP_PLACE:
+                    if step_elapsed >= STEP_PLACE_TIME:
+                        step_phase = STEP_TRANSFER
+                        motion_t0 = data.time
+
+                elif step_phase == STEP_TRANSFER:
+                    if step_elapsed >= STEP_TRANSFER_TIME:
+                        step_phase = STEP_IDLE
+                        motion_mode = MODE_NONE
+                        motion_t0 = data.time
+
+            # =========================================================
+            # END ROLLING / SLANT MODES
+            # =========================================================
+            if motion_mode == MODE_ROLL_MOVE and jump_state == STATE_BALANCE:
+                if abs(x - x_goal) < X_GOAL_TOL and abs(xdot) < 0.04:
+                    motion_mode = MODE_NONE
+                    motion_t0 = data.time
+
+            if motion_mode == MODE_SLANT and jump_state == STATE_BALANCE:
+                if data.time - motion_t0 > 3.0:
+                    motion_mode = MODE_NONE
+                    motion_t0 = data.time
+
+            if motion_mode == MODE_INDIVIDUAL_LEG and jump_state == STATE_BALANCE:
+                if data.time - motion_t0 > 3.0:
+                    motion_mode = MODE_NONE
+                    motion_t0 = data.time
+
             # -----------------------------
             # Leg target generation for each state
             # -----------------------------
@@ -1204,6 +1570,113 @@ def run():  # Main function that loads the robot and runs the feedback loop.
                 hip_target_R = hip_stand_R
                 knee_target_L = knee_stand_L
                 knee_target_R = knee_stand_R
+
+            # =========================================================
+            # COMMON + DIFFERENTIAL LEG CONTROL
+            # =========================================================
+
+            # The existing state machine produced these as symmetric targets.
+            # Treat them as the common posture first.
+            hip_common = 0.5 * (hip_target_L + hip_target_R)
+            knee_common = 0.5 * (knee_target_L + knee_target_R)
+
+            hip_diff = 0.0
+            knee_diff = 0.0
+
+            # ---------------------------------------------------------
+            # 1. Individual leg actuation test
+            # ---------------------------------------------------------
+            if motion_mode == MODE_INDIVIDUAL_LEG and jump_state == STATE_BALANCE:
+                t = data.time - motion_t0
+
+                hip_diff = 0.06 * math.sin(2.0 * math.pi * 0.5 * t) #0.28
+                knee_diff = 0.08 * math.sin(2.0 * math.pi * 0.5 * t) #0.30
+
+            # ---------------------------------------------------------
+            # 2. Controlled sideways slant
+            # ---------------------------------------------------------
+            elif motion_mode == MODE_SLANT and jump_state == STATE_BALANCE:
+
+                roll_error = slant_ref - roll
+                d_roll = K_ROLL_P * roll_error - K_ROLL_D * roll_rate
+                d_roll = clamp(d_roll, -LEG_DIFF_MAX, +LEG_DIFF_MAX)
+
+                hip_diff = HIP_ROLL_TO_DIFF * d_roll
+                knee_diff = KNEE_ROLL_TO_DIFF * d_roll
+
+            # ---------------------------------------------------------
+            # 3. Step-by-step one-leg movement
+            # ---------------------------------------------------------
+            elif motion_mode == MODE_STEP and jump_state == STATE_BALANCE:
+
+                # Shift body slightly toward support leg.
+                if step_side == "L":
+                    # left is swing, right is support
+                    roll_ref = -STEP_ROLL_BIAS
+                else:
+                    # right is swing, left is support
+                    roll_ref = +STEP_ROLL_BIAS
+
+                roll_error = roll_ref - roll
+                d_roll = K_ROLL_P * roll_error - K_ROLL_D * roll_rate
+                d_roll = clamp(d_roll, -LEG_DIFF_MAX, +LEG_DIFF_MAX)
+
+                hip_diff = HIP_ROLL_TO_DIFF * d_roll
+                knee_diff = KNEE_ROLL_TO_DIFF * d_roll
+
+            # Convert common + differential into left/right targets.
+            hip_target_L, hip_target_R, knee_target_L, knee_target_R = leg_common_diff_to_targets(
+                hip_common,
+                knee_common,
+                hip_diff,
+                knee_diff
+            )
+
+            # =========================================================
+            # ADD SWING-LEG MOTION FOR STEP MODE
+            # =========================================================
+            if motion_mode == MODE_STEP and jump_state == STATE_BALANCE:
+
+                phase_elapsed = data.time - motion_t0
+
+                swing_hip_offset = 0.0
+                swing_knee_offset = 0.0
+
+                if step_phase == STEP_UNLOAD:
+                    a = smoothstep01(phase_elapsed, STEP_UNLOAD_TIME)
+                    swing_hip_offset = STEP_HIP_LIFT * a
+                    swing_knee_offset = STEP_KNEE_LIFT * a
+
+                elif step_phase == STEP_SWING:
+                    prog, lift = swing_profile01(phase_elapsed, STEP_SWING_TIME)
+
+                    swing_hip_offset = STEP_HIP_LIFT * lift + step_dir * STEP_HIP_SWING * (prog - 0.5)
+                    swing_knee_offset = STEP_KNEE_LIFT * lift + step_dir * STEP_KNEE_SWING * (prog - 0.5)
+
+                elif step_phase == STEP_PLACE:
+                    a = 1.0 - smoothstep01(phase_elapsed, STEP_PLACE_TIME)
+                    swing_hip_offset = STEP_HIP_LIFT * a
+                    swing_knee_offset = STEP_KNEE_LIFT * a
+
+                if step_side == "L":
+                    hip_target_L += swing_hip_offset
+                    knee_target_L += swing_knee_offset
+                else:
+                    hip_target_R += swing_hip_offset
+                    knee_target_R += swing_knee_offset
+
+            # =========================================================
+            # LEG COMMAND SLEW LIMITING
+            # =========================================================
+            hip_target_L = slew(hip_target_L, prev_hip_L_cmd, LEG_DQ_MAX)
+            hip_target_R = slew(hip_target_R, prev_hip_R_cmd, LEG_DQ_MAX)
+            knee_target_L = slew(knee_target_L, prev_knee_L_cmd, LEG_DQ_MAX)
+            knee_target_R = slew(knee_target_R, prev_knee_R_cmd, LEG_DQ_MAX)
+
+            prev_hip_L_cmd = hip_target_L
+            prev_hip_R_cmd = hip_target_R
+            prev_knee_L_cmd = knee_target_L
+            prev_knee_R_cmd = knee_target_R
 
             # Clamp to XML actuator ctrlranges.
             hip_target_L = clamp(hip_target_L, HIP_CTRL_MIN, HIP_CTRL_MAX)
@@ -1328,6 +1801,14 @@ def run():  # Main function that loads the robot and runs the feedback loop.
                         f"ThrA={thrust_alpha_now:4.2f} "
                         f"Hq={hip_q_L:+5.2f} Kq={knee_q_L:+5.2f} "
                         f"He={hip_err_L:+5.2f} Ke={knee_err_L:+5.2f} "
+                        f"Mode={motion_mode:>7} "
+                        f"Step={step_phase:>10} "
+                        f"Roll={math.degrees(roll):+5.2f} "
+                        f"RollRate={math.degrees(roll_rate):+7.1f} "
+                        f"LFn={left_fn:6.2f} "
+                        f"RFn={right_fn:6.2f} "
+                        f"XGoal={x_goal:+6.3f} "
+                        f"XErr={(x_goal - x):+6.3f} "
                         f"{status}"
 )
 
