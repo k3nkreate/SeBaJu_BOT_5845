@@ -64,7 +64,7 @@ LEG_ACTUATOR_MODE = "position_servo"
 # =========================================================
 # EXPERIMENT SELECTOR
 # =========================================================
-EXPERIMENT_MODE = "SLANT_RIGHT"  # Choose one of the following experiment modes.
+EXPERIMENT_MODE = "BASE_JUMP"  # Choose one of the following experiment modes.
 # Options:
 # "BASE_JUMP"
 # "INDIVIDUAL_LEG_TEST"
@@ -80,7 +80,7 @@ EXPERIMENT_MODE = "SLANT_RIGHT"  # Choose one of the following experiment modes.
 
 #===========================================================================================
 # JUMP TEST
-JUMP_ENABLE = JUMP_ENABLE = EXPERIMENT_MODE in ["BASE_JUMP", "JUMP_FORWARD", "JUMP_BACKWARD"]
+JUMP_ENABLE = EXPERIMENT_MODE in ["BASE_JUMP", "JUMP_FORWARD", "JUMP_BACKWARD"]
 JUMP_START_TIME = 5.0
 JUMP_ONCE = True
 
@@ -100,6 +100,7 @@ MODE_NONE = "NONE"
 MODE_INDIVIDUAL_LEG = "INDIVIDUAL_LEG"
 MODE_SLANT = "SLANT"
 MODE_ROLL_MOVE = "ROLL_MOVE"
+MODE_HOLD_X = "HOLD_X"
 MODE_STEP = "STEP"
 MODE_JUMP_X = "JUMP_X"
 
@@ -112,6 +113,10 @@ STEP_UNLOAD = "STEP_UNLOAD"
 STEP_SWING = "STEP_SWING"
 STEP_PLACE = "STEP_PLACE"
 STEP_TRANSFER = "STEP_TRANSFER"
+
+# ========================================================
+MOTION_DURATION = 5.0  # seconds
+# ========================================================
 
 # JUMP TIMING AND DETECTION SETTINGS
 T_PRELOAD = 0.80                   # Slow crouch time, seconds.
@@ -215,7 +220,11 @@ LEG_DIFF_MAX = 0.22
 X_CMD_RATE = 0.10 #0.20          # m/s reference movement speed
 X_GOAL_TOL = 0.015         # m
 X_I_MAX = 0.08
-K_X_I = 0.10
+K_X_I = 0.03 #0.03
+ROLL_TARGET_DISTANCE = 2 #0.12
+ROLL_MAX_SAFE_VEL = 0.45
+ROLL_MAX_SAFE_LEAN = math.radians(12.0)
+ROLL_HOLD_TIME = 0.60
 
 # =========================================================
 # STEPPING TEST
@@ -233,18 +242,24 @@ STEP_KNEE_LIFT = -0.20
 STEP_HIP_SWING = -0.10
 STEP_KNEE_SWING = +0.08
 
+STEP_UNLOAD_FN_MAX = 8.0
+
 # =========================================================
 # TRANSLATIONAL JUMP
 # =========================================================
-JUMP_X_PITCH_BIAS = math.radians(1.8)
-JUMP_X_WHEEL_FF = 0.08
+JUMP_X_PITCH_BIAS = math.radians(-2.0) # 1.8 degrees forward lean for a forward jump
+JUMP_X_WHEEL_FF = 0.0 # 0.08
 JUMP_X_MAX = 0.18
 
 # =========================================================
 # COMMAND SLEW LIMITS
 # =========================================================
-LEG_DQ_MAX = 0.020
-WHEEL_DU_MAX = 0.020
+LEG_DQ_MAX_NORMAL = 0.020     # Used for slant, individual leg and step tests.
+LEG_DQ_MAX_JUMP   = 999.0     # Effectively disables extra slew during jump phases.
+
+WHEEL_DU_MAX_NORMAL = 0.020   # Used for normal rolling and balance.
+WHEEL_DU_MAX_JUMP   = 999.0   # Allows original jump wheel behaviour during thrust.
+
 
 # =============================================================
 # LEG LOCK GAINS SPECIFICALLY FOR HIP AND KNEE "ACTUATOR-MOTOR" [OPTIONAL]
@@ -692,7 +707,7 @@ def run():  # Main function that loads the robot and runs the feedback loop.
     landing_x_ref = 0.0
     x_ref_active = 0.0
 
-        # =========================================================
+    # =========================================================
     # HIGH-LEVEL MOTION VARIABLES
     # =========================================================
     motion_mode = MODE_NONE
@@ -702,6 +717,7 @@ def run():  # Main function that loads the robot and runs the feedback loop.
     x_goal = 0.0
     x_cmd = 0.0
     x_i = 0.0
+    roll_hold_timer = 0.0
 
     slant_ref = 0.0
 
@@ -938,8 +954,13 @@ def run():  # Main function that loads the robot and runs the feedback loop.
             # MODE-AWARE X REFERENCE
             # =========================================================
             if motion_mode == MODE_ROLL_MOVE and jump_state == STATE_BALANCE:
+                # Move reference gradually toward the target
                 x_cmd = slew(x_goal, x_cmd, X_CMD_RATE * dt)
                 x_ref = x_cmd
+
+            elif motion_mode == MODE_HOLD_X and jump_state == STATE_BALANCE:
+                # After rolling, hold the new location instead of returning to x=0
+                x_ref = x_ref_active
 
             elif jump_state in [STATE_LANDING, STATE_RECOVERY, STATE_SETTLE]:
                 x_ref = x_ref_active
@@ -975,15 +996,17 @@ def run():  # Main function that loads the robot and runs the feedback loop.
             wheel_ff = 0.0
 
             # For translational jump, lean slightly in desired direction.
-            if motion_mode == MODE_JUMP_X and jump_state in [STATE_PRELOAD, STATE_THRUST]:
-                theta_ref_local = theta_ref + jump_direction * JUMP_X_PITCH_BIAS
+            if motion_mode == MODE_JUMP_X and jump_state == STATE_PRELOAD:
+                # Create a very small pre-lean before the jump.
+                # Do not fight the leg thrust phase with wheel feedforward yet.
+                a_ff = smoothstep01(elapsed, T_PRELOAD)
+                theta_ref_local = theta_ref + jump_direction * JUMP_X_PITCH_BIAS * a_ff
+                wheel_ff = 0.0
 
-                if jump_state == STATE_PRELOAD:
-                    a_ff = smoothstep01(elapsed, T_PRELOAD)
-                else:
-                    a_ff = fast_thrust01(elapsed, T_THRUST)
-
-                wheel_ff = jump_direction * JUMP_X_WHEEL_FF * a_ff
+            elif motion_mode == MODE_JUMP_X and jump_state == STATE_THRUST:
+                # During thrust, prioritise vertical impulse and stability.
+                theta_ref_local = theta_ref
+                wheel_ff = 0.0
 
             wheel_u_unsat = (
                 Kth   * (theta - theta_ref_local)
@@ -1000,7 +1023,24 @@ def run():  # Main function that loads the robot and runs the feedback loop.
                 +max_wheel_state
             )
 
-            wheel_u = slew(wheel_u_target, prev_wheel_u, WHEEL_DU_MAX)
+            # =========================================================
+            # WHEEL COMMAND SLEW LIMITING
+            # =========================================================
+            # Keep smooth wheel commands for rolling/slanting,
+            # but do not over-filter the wheel controller during jump phases.
+            if jump_state in [
+                STATE_PRELOAD,
+                STATE_THRUST,
+                STATE_FLIGHT,
+                STATE_LANDING,
+                STATE_RECOVERY,
+                STATE_SETTLE
+            ]:
+                wheel_du_now = WHEEL_DU_MAX_JUMP
+            else:
+                wheel_du_now = WHEEL_DU_MAX_NORMAL
+
+            wheel_u = slew(wheel_u_target, prev_wheel_u, wheel_du_now)
             prev_wheel_u = wheel_u
 
             data.ctrl[act_lwheel] = wheel_u
@@ -1103,15 +1143,19 @@ def run():  # Main function that loads the robot and runs the feedback loop.
 
                 elif EXPERIMENT_MODE == "ROLL_FORWARD":
                     motion_mode = MODE_ROLL_MOVE
-                    x_goal = x + 0.20
+                    x_goal = x + ROLL_TARGET_DISTANCE
                     x_cmd = x
+                    x_i = 0.0
+                    roll_hold_timer = 0.0
                     motion_t0 = data.time
                     motion_started = True
 
                 elif EXPERIMENT_MODE == "ROLL_BACKWARD":
                     motion_mode = MODE_ROLL_MOVE
-                    x_goal = x - 0.20
+                    x_goal = x - ROLL_TARGET_DISTANCE
                     x_cmd = x
+                    x_i = 0.0
+                    roll_hold_timer = 0.0
                     motion_t0 = data.time
                     motion_started = True
 
@@ -1498,17 +1542,39 @@ def run():  # Main function that loads the robot and runs the feedback loop.
             # END ROLLING / SLANT MODES
             # =========================================================
             if motion_mode == MODE_ROLL_MOVE and jump_state == STATE_BALANCE:
-                if abs(x - x_goal) < X_GOAL_TOL and abs(xdot) < 0.04:
-                    motion_mode = MODE_NONE
+
+                roll_error = x_goal - x
+
+                # Safety: stop rolling if the robot is becoming unstable
+                if abs(xdot) > ROLL_MAX_SAFE_VEL or abs(theta - theta_ref) > ROLL_MAX_SAFE_LEAN:
+                    x_ref_active = x
+                    motion_mode = MODE_HOLD_X
+                    roll_hold_timer = 0.0
                     motion_t0 = data.time
+
+                # Normal completion: close to target and nearly stopped
+                elif abs(roll_error) < X_GOAL_TOL and abs(xdot) < 0.04:
+                    roll_hold_timer += dt
+
+                    if roll_hold_timer >= ROLL_HOLD_TIME:
+                        x_ref_active = x
+                        motion_mode = MODE_HOLD_X
+                        motion_t0 = data.time
+
+                else:
+                    roll_hold_timer = 0.0
+
+            # -------------------------------------------------------------
 
             if motion_mode == MODE_SLANT and jump_state == STATE_BALANCE:
-                if data.time - motion_t0 > 3.0:
+                if data.time - motion_t0 > MOTION_DURATION:
                     motion_mode = MODE_NONE
                     motion_t0 = data.time
 
+            # -------------------------------------------------------------
+
             if motion_mode == MODE_INDIVIDUAL_LEG and jump_state == STATE_BALANCE:
-                if data.time - motion_t0 > 3.0:
+                if data.time - motion_t0 > MOTION_DURATION:
                     motion_mode = MODE_NONE
                     motion_t0 = data.time
 
@@ -1589,20 +1655,32 @@ def run():  # Main function that loads the robot and runs the feedback loop.
             if motion_mode == MODE_INDIVIDUAL_LEG and jump_state == STATE_BALANCE:
                 t = data.time - motion_t0
 
-                hip_diff = 0.06 * math.sin(2.0 * math.pi * 0.5 * t) #0.28
-                knee_diff = 0.08 * math.sin(2.0 * math.pi * 0.5 * t) #0.30
+                hip_diff = 0.10 * math.sin(2.0 * math.pi * 0.5 * t) #0.28
+                knee_diff = 0.12 * math.sin(2.0 * math.pi * 0.5 * t) #0.30
 
             # ---------------------------------------------------------
             # 2. Controlled sideways slant
             # ---------------------------------------------------------
             elif motion_mode == MODE_SLANT and jump_state == STATE_BALANCE:
 
-                roll_error = slant_ref - roll
-                d_roll = K_ROLL_P * roll_error - K_ROLL_D * roll_rate
-                d_roll = clamp(d_roll, -LEG_DIFF_MAX, +LEG_DIFF_MAX)
+                # Time since slant mode started
+                t_slant = data.time - motion_t0
 
-                hip_diff = HIP_ROLL_TO_DIFF * d_roll
-                knee_diff = KNEE_ROLL_TO_DIFF * d_roll
+                # Smoothly build the slant command instead of applying it suddenly
+                a_slant = smoothstep01(t_slant, 0.80)
+
+                # Direction of desired slant
+                # slant_ref > 0 means one side, slant_ref < 0 means the opposite side
+                slant_sign = 1.0 if slant_ref > 0.0 else -1.0
+
+                # Direct differential leg command
+                # Start small. Increase only after testing.
+                hip_diff = slant_sign * 0.08 * a_slant
+                knee_diff = slant_sign * 0.10 * a_slant
+
+                # Safety: do not allow excessive differential leg motion
+                hip_diff = clamp(hip_diff, -0.14, +0.14)
+                knee_diff = clamp(knee_diff, -0.16, +0.16)
 
             # ---------------------------------------------------------
             # 3. Step-by-step one-leg movement
@@ -1668,10 +1746,22 @@ def run():  # Main function that loads the robot and runs the feedback loop.
             # =========================================================
             # LEG COMMAND SLEW LIMITING
             # =========================================================
-            hip_target_L = slew(hip_target_L, prev_hip_L_cmd, LEG_DQ_MAX)
-            hip_target_R = slew(hip_target_R, prev_hip_R_cmd, LEG_DQ_MAX)
-            knee_target_L = slew(knee_target_L, prev_knee_L_cmd, LEG_DQ_MAX)
-            knee_target_R = slew(knee_target_R, prev_knee_R_cmd, LEG_DQ_MAX)
+            # Important:
+            # Do NOT apply the optional-experiment slew limiter during jump phases.
+            # The visible jump relies on a fast THRUST leg command.
+            if jump_state == STATE_BALANCE and motion_mode in [
+                MODE_INDIVIDUAL_LEG,
+                MODE_SLANT,
+                MODE_STEP
+            ]:
+                leg_dq_now = LEG_DQ_MAX_NORMAL
+            else:
+                leg_dq_now = LEG_DQ_MAX_JUMP
+
+            hip_target_L = slew(hip_target_L, prev_hip_L_cmd, leg_dq_now)
+            hip_target_R = slew(hip_target_R, prev_hip_R_cmd, leg_dq_now)
+            knee_target_L = slew(knee_target_L, prev_knee_L_cmd, leg_dq_now)
+            knee_target_R = slew(knee_target_R, prev_knee_R_cmd, leg_dq_now)
 
             prev_hip_L_cmd = hip_target_L
             prev_hip_R_cmd = hip_target_R
