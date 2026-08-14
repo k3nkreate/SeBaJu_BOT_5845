@@ -1,0 +1,122 @@
+<mujoco model="SeBaJu_BOT(II)">
+  <!-- All angular values in this XML are radians. -->
+  <compiler angle="radian" coordinate="local" inertiafromgeom="true"/>
+
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="implicitfast"/>
+
+  <default>
+    <joint damping="1.0" armature="0.005" limited="true"/>
+    <geom contype="1" conaffinity="1" friction="1.8 0.03 0.003"/>
+    <motor ctrllimited="true"/>
+  </default>
+
+  <asset>
+    <texture name="grid" type="2d" builtin="checker" width="512" height="512" rgb1="0.25 0.25 0.25" rgb2="0.35 0.35 0.35"/>
+    <material name="ground_mat" texture="grid" texrepeat="10 10" rgba="0.35 0.45 0.25 1"/>
+    <material name="torso_mat" rgba="0.55 0.55 0.58 1"/>
+    <material name="leg_mat" rgba="0.75 0.18 0.12 1"/>
+    <material name="wheel_mat" rgba="0.03 0.03 0.03 1"/>
+    <material name="hub_mat" rgba="0.10 0.70 0.55 1"/>
+    <material name="imu_mat" rgba="1 0 0 1"/>
+  </asset>
+
+  <worldbody>
+    <light directional="true" pos="0 -3 4" dir="0 0 -1" diffuse="0.85 0.85 0.85"/>
+    <light directional="true" pos="0 0 1" dir="0.2 0 -1" diffuse="0.85 0.85 0.80" castshadow="true"/>
+    <light directional="true" pos="0 0 1" dir="-0.2 0 -1" diffuse="0.40 0.40 0.35" castshadow="false"/>
+    <camera name="side" pos="0 -1.7 0.35" xyaxes="1 0 0 0 0.25 0.97"/>
+    <geom name="ground" type="plane" size="10 5 0.1" material="ground_mat" friction="1.2 0.05 0.005"/>
+
+    <!--
+      Geometry target:
+      - Wheel radius = 0.06 m, so wheel axle starts at z = 0.06 m.
+      - Thigh length = 0.13 m, backward/down at 0.7855 rad.
+      - Shank length = 0.13 m, 1.571 rad from thigh, forward/down to wheel.
+      - hip_x and wheel_x align, so whole robot mass can sit directly above axle.
+      - Rectangular torso length = 0.15 m.
+    -->
+    <body name="torso" pos="0 0 0.2439">
+      <freejoint name="root"/>
+
+      <!-- Rectangular torso.  Center is shifted slightly forward to counter the backward leg mass. -->
+      <geom name="torso_box" type="box" pos="0.025 0 0" size="0.075 0.095 0.055" material="torso_mat" mass="2.50"/>
+
+      <!-- Small forward-low ballast to keep total CoM near wheel axle and low, without making robot too heavy. -->
+      <geom name="front_low_balance_mass" type="box" pos="0.045 0 -0.045" size="0.035 0.070 0.018" rgba="0.20 0.20 0.22 1" mass="0.35"/>
+
+      <!-- IMU at the designed torso center; controller should still use robot_com for true full-system CoM. -->
+      <site name="imu" pos="0.0 0 0" size="0.012" material="imu_mat"/>
+
+      <!-- Left side leg: attached to torso side, folded like the reference robot. -->
+      <body name="left_thigh" pos="0 0.095 0">
+        <joint name="left_hip" type="hinge" axis="0 1 0" range="-0.9 0.9" damping="0.8"/>
+        <geom name="left_thigh_geom" type="capsule" fromto="0 0 0  -0.0919 0 -0.0919" size="0.014" material="leg_mat" mass="0.18"/>
+
+        <body name="left_shank" pos="-0.0919 0 -0.0919">
+          <joint name="left_knee" type="hinge" axis="0 1 0" range="-0.9 0.9" damping="0.8"/>
+          <geom name="left_shank_geom" type="capsule" fromto="0 0 0  0.0919 0 -0.0919" size="0.012" material="leg_mat" mass="0.16"/>
+
+          <body name="left_wheel" pos="0.0919 0.052 -0.0919">
+            <joint name="left_wheel_joint" type="hinge" axis="0 1 0" limited="false" damping="0.02" armature="0.002"/>
+            <geom name="left_wheel_geom" type="cylinder" size="0.06 0.028" quat="0.7071068 0.7071068 0 0" material="wheel_mat" mass="0.32" friction="2.2 0.04 0.004"/>
+            <geom name="left_wheel_hub" type="cylinder" size="0.025 0.031" quat="0.7071068 0.7071068 0 0" material="hub_mat" mass="0.06" contype="0" conaffinity="0"/>
+          </body>
+        </body>
+      </body>
+
+      <!-- Right side leg: mirror of left side. -->
+      <body name="right_thigh" pos="0 -0.095 0">
+        <joint name="right_hip" type="hinge" axis="0 1 0" range="-0.9 0.9" damping="0.8"/>
+        <geom name="right_thigh_geom" type="capsule" fromto="0 0 0  -0.0919 0 -0.0919" size="0.014" material="leg_mat" mass="0.18"/>
+
+        <body name="right_shank" pos="-0.0919 0 -0.0919">
+          <joint name="right_knee" type="hinge" axis="0 1 0" range="-0.9 0.9" damping="0.8"/>
+          <geom name="right_shank_geom" type="capsule" fromto="0 0 0  0.0919 0 -0.0919" size="0.012" material="leg_mat" mass="0.16"/>
+
+          <body name="right_wheel" pos="0.0919 -0.052 -0.0919">
+            <joint name="right_wheel_joint" type="hinge" axis="0 1 0" limited="false" damping="0.02" armature="0.002"/>
+            <geom name="right_wheel_geom" type="cylinder" size="0.06 0.028" quat="0.7071068 0.7071068 0 0" material="wheel_mat" mass="0.32" friction="2.2 0.04 0.004"/>
+            <geom name="right_wheel_hub" type="cylinder" size="0.025 0.031" quat="0.7071068 0.7071068 0 0" material="hub_mat" mass="0.06" contype="0" conaffinity="0"/>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <!-- Hip/knee motors are for holding leg geometry; wheels are for balancing. -->
+    <!-- Using the actuator/position (servo positioning) for pure position hold for the hip and knee joints -->
+    
+    <position name="left_hip_servo"  joint="left_hip"  kp="160" kv="12" ctrlrange="-0.6 0.6" forcerange="-60 60"/>
+    <position name="right_hip_servo" joint="right_hip" kp="160" kv="12" ctrlrange="-0.6 0.6" forcerange="-60 60"/>
+    <position name="left_knee_servo" joint="left_knee" kp="200" kv="14" ctrlrange="-0.8 0.8" forcerange="-60 60"/>
+    <position name="right_knee_servo" joint="right_knee" kp="200" kv="14" ctrlrange="-0.8 0.8" forcerange="-60 60"/> 
+
+    <!-- Using actuator/motor (motor movement), alongside a python control command that locks/ensures motor maintains a position-->
+    <!--
+    <motor name="left_hip_motor"  joint="left_hip"  gear="30" ctrlrange="-1 1" forcerange="-25 25"/>
+    <motor name="right_hip_motor" joint="right_hip" gear="30" ctrlrange="-1 1" forcerange="-25 25"/>
+    <motor name="left_knee_motor" joint="left_knee" gear="30" ctrlrange="-1 1" forcerange="-25 25"/>
+    <motor name="right_knee_motor" joint="right_knee" gear="30" ctrlrange="-1 1" forcerange="-25 25"/> -->
+
+    <motor name="left_wheel_motor" joint="left_wheel_joint" gear="18" ctrlrange="-1 1"/>
+    <motor name="right_wheel_motor" joint="right_wheel_joint" gear="18" ctrlrange="-1 1"/>
+  </actuator>
+
+  <sensor>
+    <framequat name="imu_quat" objtype="site" objname="imu"/>
+    <gyro name="imu_gyro" site="imu"/>
+    <accelerometer name="imu_accel" site="imu"/>
+    <framepos name="imu_pos" objtype="site" objname="imu"/>
+    <subtreecom name="robot_com" body="torso"/>
+    <framepos name="left_wheel_pos" objtype="body" objname="left_wheel"/>
+    <framepos name="right_wheel_pos" objtype="body" objname="right_wheel"/>
+    <jointvel name="left_wheel_speed" joint="left_wheel_joint"/>
+    <jointvel name="right_wheel_speed" joint="right_wheel_joint"/>
+  </sensor>
+
+  <!--
+  <keyframe>
+    <key name="stand" qpos="0 0 0.2439 1 0 0 0  0 0 0 0 0 0" ctrl="0 0 0 0 0 0"/>
+  </keyframe> -->
+</mujoco>

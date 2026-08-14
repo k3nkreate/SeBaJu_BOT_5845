@@ -3,74 +3,16 @@
     <!--=======================================================================
     SeBaJu Bot — Ascento-conformant two-wheeled balancing robot
     =========================================================================
+    This model is designed to be as close as possible to Ascento's physical
 
-    COORDINATE CONVENTION  (axis="0 1 0", right-hand rule around +Y)
-    ─────────────────────────────────────────────────────────────────
-    Thumb points in +Y (robot's left).  Fingers curl +Z → +X.
-    Positive angle = component tips FORWARD (+X direction).
-
-    To achieve a DEEPER crouched posture (lower CoM, better stability):
-      • Hip ref = −0.785 rad (−45°) → thigh tips further BACKWARD (−X)
-      • Knee ref = +1.571 rad (+90°) → shank bends forward relative to thigh
-        → absolute shank angle = −0.785 + 1.571 = +0.786 rad from vertical
-        → X offsets cancel: wheel directly under CoM ✓
-
-    WHEEL-UNDER-CoM CONSTRAINT (must always hold):
-      For X offsets to cancel:  sin(hip_ref) + sin(hip_ref + knee_ref) = 0
-      → knee_ref = −2 × hip_ref
-      → hip_ref = −0.785 rad gives knee_ref = +1.571 rad (= pi/2, anatomical limit)
-      This is the MAXIMUM feasible crouch within joint limits.
-
-    GEOMETRY (verified):
-      thigh = shank = 0.22 m,  wheel radius = 0.06 m
-      Thigh vector:  (sin(-0.785)x0.22, 0, -cos(0.785)x0.22) = (-0.1556, 0, -0.1556) m
-      Shank vector:  (sin(+0.786)x0.22, 0, -cos(0.786)x0.22) = (+0.1557, 0, -0.1555) m
-      Wheel X offset from hip: -0.1556 + 0.1557 = 0.000 m (under CoM)
-      Leg height:   0.1556 + 0.1555 = 0.3111 m
-      Base height:  0.3111 + 0.060  = 0.3711 m  keyframe z = 0.371
-
-    STABILITY BENEFIT:
-      Toppling torque = m*g*h_CoM*sin(theta)
-      Old h_CoM = 0.423 m, new h_CoM = 0.371 m: 12.3% reduction in torque per degree of tilt.
-
-    CoM LOWERED (further):
-      inertial pos="0 0 0.00" stays — local frame, base body shifts in world.
-      IMU site lowered to pos="0 0 0.07" (top of 7cm half-length cylinder)
-
-    ASCENTO ALIGNMENT
-    ─────────────────
-    • Body is the combined torso — no separate torso_pitch joint.
-      Ascento's stabilising controller acts directly on the inverted-pendulum
-      body (the main chassis) via the wheel motors.  There is no inner joint
-      to keep level.
-    • Hip motors hold leg geometry; wheel motors provide balance torque.
-    • Torsion springs at knee replicated by joint stiffness.
-
-    ACTUATOR ctrl[] MAP
-    ───────────────────
-      [0] left_hip_motor
-      [1] right_hip_motor
-      [2] left_knee_motor
-      [3] right_knee_motor
-      [4] left_wheel_motor
-      [5] right_wheel_motor
-
-    SENSOR sensordata[] MAP
-    ───────────────────────
-      [0..3]  quaternion (w,x,y,z) — imu_site orientation in world frame
-      [4..6]  gyro (rad/s) — roll, PITCH, yaw  ← [5] is dθ/dt
-      [7..9]  accelerometer (m/s²) — x, y, z
-      [10]    left  wheel joint angle  (rad)
-      [11]    left  wheel joint velocity (rad/s)
-      [12]    right wheel joint angle  (rad)
-      [13]    right wheel joint velocity (rad/s)
     =======================================================================-->
 
-    <option timestep="0.002" gravity="0 0 -9.81" integrator="RK4"/>
+    <option timestep="0.002" gravity="0 0 -9.81" integrator="RK4"
+            iterations="50" tolerance="1e-10"/>
     <compiler angle="radian"/>
 
     <default>
-        <joint damping="0.5" armature="0.01" stiffness="0" frictionloss="0.01"/>
+        <joint damping="0.5" armature="0.01" stiffness="0" frictionloss="0.02"/>
         <geom friction="1 0.05 0.01"/>
     </default>
 
@@ -96,14 +38,196 @@
         <material name="thigh_mat" rgba="0.86 0.78 0.74 1"/>
         <material name="shank_mat" rgba="0.55 0.33 0.14 1"/>
         <material name="wheel_mat" rgba="0.05 0.05 0.05 1"/>
+        <material name="ground_mat" rgba="0.35 0.45 0.25 1"/>
+        <material name="ridge_mat"  rgba="0.55 0.35 0.15 1"/>
     </asset>
 
     <worldbody>
-        <light pos="0 0 4" dir="0 0 -1" diffuse="0.9 0.9 0.9"/>
-
-        <geom name="ground" type="plane" size="10 10 0.1"
+        <light pos="0 0 8" dir="0 0 -1" diffuse="0.9 0.9 0.9" castshadow="true"/>
+        <light pos="5 0 4" dir="-1 0 -1" diffuse="0.4 0.4 0.4" castshadow="false"/>
+        
+        <!--═══════════════════════════════════════════════════════════
+        GROUND PLANE — represents soil floor of the field
+        ═══════════════════════════════════════════════════════════════-->
+        <geom name="ground" type="plane" size="20 5 0.1"
+              material="ground_mat"
               contype="1" conaffinity="1"
-              rgba="0.35 0.45 0.35 1" friction="1.0 0.05 0.01"/>
+              friction="1.0 0.3 0.01"/>
+        
+        <!--═══════════════════════════════════════════════════════════
+        FARM RIDGE ROWS
+        ─────────────────────────────────────────────────────────────
+        6 ridges running in X direction (length=20m, width=0.3m, height=0.08m)
+        Spacing: robot gap = 0.6m, ridge width = 0.3m → row pitch = 0.9m
+        Y centres: starting at -2.25m, step +0.9m
+        The robot starts at y=0.0 (in the gap between ridge at y=-0.15 and y=+0.45)
+
+        contype="0" conaffinity="0" on ridges so the robot body doesn't collide
+        with them — only the wheels touch the ground plane. If you want the robot
+        to go OVER ridges, change to contype="1" conaffinity="1".
+        ═══════════════════════════════════════════════════════════════-->
+
+        <!-- Ridge 1 -->
+        <geom name="ridge_1" type="box" size="10.0 0.15 0.04"
+              pos="0 -2.25 0.04"
+              material="ridge_mat"
+              contype="0" conaffinity="0"/>
+
+        <!-- Ridge 2 -->
+        <geom name="ridge_2" type="box" size="10.0 0.15 0.04"
+              pos="0 -1.35 0.04"
+              material="ridge_mat"
+              contype="0" conaffinity="0"/>
+
+        <!-- Ridge 3 -->
+        <geom name="ridge_3" type="box" size="10.0 0.15 0.04"
+              pos="0 -0.45 0.04"
+              material="ridge_mat"
+              contype="0" conaffinity="0"/>
+
+        <!-- Ridge 4 (robot starts in gap between ridge 3 and 4) -->
+        <geom name="ridge_4" type="box" size="10.0 0.15 0.04"
+              pos="0 +0.45 0.04"
+              material="ridge_mat"
+              contype="0" conaffinity="0"/>
+
+        <!-- Ridge 5 -->
+        <geom name="ridge_5" type="box" size="10.0 0.15 0.04"
+              pos="0 +1.35 0.04"
+              material="ridge_mat"
+              contype="0" conaffinity="0"/>
+
+        <!-- Ridge 6 -->
+        <geom name="ridge_6" type="box" size="10.0 0.15 0.04"
+              pos="0 +2.25 0.04"
+              material="ridge_mat"
+              contype="0" conaffinity="0"/>
+
+        <!--═══════════════════════════════════════════════════
+        TREE MARKERS — visual only, spaced 2m along each ridge
+        trunk: brown cylinder, canopy: green sphere
+        contype/conaffinity = 0 → robot passes through freely
+        ═══════════════════════════════════════════════════════-->
+
+        <!-- ── RIDGE 1  y=-2.25 ── -->
+        <geom type="cylinder" size="0.025 0.05" pos="-8 -2.25 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos="-8 -2.25 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos="-6 -2.25 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos="-6 -2.25 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos="-4 -2.25 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos="-4 -2.25 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos="-2 -2.25 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos="-2 -2.25 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos=" 0 -2.25 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos=" 0 -2.25 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos=" 2 -2.25 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos=" 2 -2.25 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos=" 4 -2.25 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos=" 4 -2.25 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos=" 6 -2.25 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos=" 6 -2.25 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos=" 8 -2.25 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos=" 8 -2.25 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+
+        <!-- ── RIDGE 2  y=-1.35 ── -->
+        <geom type="cylinder" size="0.025 0.05" pos="-8 -1.35 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos="-8 -1.35 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos="-6 -1.35 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos="-6 -1.35 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos="-4 -1.35 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos="-4 -1.35 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos="-2 -1.35 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos="-2 -1.35 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos=" 0 -1.35 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos=" 0 -1.35 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos=" 2 -1.35 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos=" 2 -1.35 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos=" 4 -1.35 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos=" 4 -1.35 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos=" 6 -1.35 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos=" 6 -1.35 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos=" 8 -1.35 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos=" 8 -1.35 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+
+        <!-- ── RIDGE 3  y=-0.45 ── -->
+        <geom type="cylinder" size="0.025 0.05" pos="-8 -0.45 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos="-8 -0.45 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos="-6 -0.45 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos="-6 -0.45 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos="-4 -0.45 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos="-4 -0.45 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos="-2 -0.45 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos="-2 -0.45 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos=" 0 -0.45 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos=" 0 -0.45 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos=" 2 -0.45 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos=" 2 -0.45 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos=" 4 -0.45 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos=" 4 -0.45 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos=" 6 -0.45 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos=" 6 -0.45 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos=" 8 -0.45 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos=" 8 -0.45 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+
+        <!-- ── RIDGE 4  y=+0.45 ── -->
+        <geom type="cylinder" size="0.025 0.05" pos="-8  0.45 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos="-8  0.45 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos="-6  0.45 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos="-6  0.45 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos="-4  0.45 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos="-4  0.45 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos="-2  0.45 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos="-2  0.45 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos=" 0  0.45 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos=" 0  0.45 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos=" 2  0.45 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos=" 2  0.45 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos=" 4  0.45 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos=" 4  0.45 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos=" 6  0.45 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos=" 6  0.45 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos=" 8  0.45 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos=" 8  0.45 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+
+        <!-- ── RIDGE 5  y=+1.35 ── -->
+        <geom type="cylinder" size="0.025 0.05" pos="-8  1.35 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos="-8  1.35 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos="-6  1.35 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos="-6  1.35 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos="-4  1.35 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos="-4  1.35 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos="-2  1.35 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos="-2  1.35 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos=" 0  1.35 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos=" 0  1.35 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos=" 2  1.35 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos=" 2  1.35 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos=" 4  1.35 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos=" 4  1.35 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos=" 6  1.35 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos=" 6  1.35 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos=" 8  1.35 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos=" 8  1.35 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+
+        <!-- ── RIDGE 6  y=+2.25 ── -->
+        <geom type="cylinder" size="0.025 0.05" pos="-8  2.25 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos="-8  2.25 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos="-6  2.25 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos="-6  2.25 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos="-4  2.25 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos="-4  2.25 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos="-2  2.25 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos="-2  2.25 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos=" 0  2.25 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos=" 0  2.25 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos=" 2  2.25 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos=" 2  2.25 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos=" 4  2.25 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos=" 4  2.25 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos=" 6  2.25 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos=" 6  2.25 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="cylinder" size="0.025 0.05" pos=" 8  2.25 0.09" rgba="0.40 0.25 0.10 1" contype="0" conaffinity="0"/>
+        <geom type="sphere"   size="0.08"      pos=" 8  2.25 0.22" rgba="0.15 0.50 0.10 1" contype="0" conaffinity="0"/>
 
         <!--===================================================================
         BASE BODY — free-floating anchor (no torso_pitch joint)
@@ -130,7 +254,7 @@
 
             <!-- IMU site at top of torso 
             at top of torso cylinder (half-length 0.07 m above pivot)-->
-            <site name="imu_site" pos="0.0 0 0.07" size="0.01" rgba="1 1 0 1"/>
+            <site name="imu_site" pos="0.0 0 0.07" size="0.01" rgba="1 1 0 1" euler="0 0 0"/>
 
             <!--===============================================================
             LEFT LEG
@@ -162,7 +286,7 @@
                        axis="0 1 0"
                        range="-1.20 0.40"
                        ref="-0.785"
-                       damping="1.5"/>
+                       damping="1.5" frictionloss="0.05"/>
                   <!--changed quat to 1 0 0 0 ~ no rotation; ref provides required orientation-->
                 <geom name="left_thigh" type="capsule"
                       pos="0 0 -0.11"
@@ -180,7 +304,8 @@
                            axis="0 1 0"
                            range="0.20 1.80"
                            ref="1.571"
-                           stiffness="10" damping="1.0"/>
+                           springref="1.571"
+                           stiffness="5" damping="2.0"/>
                       <!--changed quat to 1 0 0 0 ~ no rotation; ref provides required orientation-->
                     <geom name="left_shank_geom" type="capsule"
                           pos="0 0 -0.11"
@@ -197,7 +322,7 @@
                               quat="0.7071 0.7071 0 0"
                               material="wheel_mat"
                               mass="0.3" contype="1" conaffinity="1"
-                              friction="1.5 0.05 0.01" pos="0 0.012 0"/>
+                              friction="1.5 0.3 0.01" pos="0 0.012 0"/>
                     </body>
                 </body>
             </body>
@@ -211,7 +336,7 @@
                        axis="0 1 0"
                        range="-1.20 0.40"
                        ref="-0.785"
-                       damping="1.5"/>
+                       damping="1.5" frictionloss="0.05"/>
 
                 <geom name="right_thigh" type="capsule"
                       pos="0 0 -0.11"
@@ -226,7 +351,8 @@
                            axis="0 1 0"
                            range="0.20 1.80"
                            ref="1.571"
-                           stiffness="10" damping="1.0"/>
+                           springref="1.571"
+                           stiffness="5" damping="2.0"/>
 
                     <geom name="right_shank_geom" type="capsule"
                           pos="0 0 -0.11"
@@ -243,13 +369,30 @@
                               quat="0.7071 0.7071 0 0"
                               material="wheel_mat"
                               mass="0.3" contype="1" conaffinity="1"
-                              friction="1.5 0.05 0.01" pos="0 -0.012 0"/>
+                              friction="1.5 0.3 0.01" pos="0 -0.012 0"/>
                     </body>
                 </body>
             </body>
 
         </body><!-- end base -->
     </worldbody>
+
+
+<!--=======================================================================
+    EQUALITY CONSTRAINTS — force left/right symmetry
+    ─────────────────────────────────────────────────────────────────────────
+    polycoef="0 1 0 0 0" means: joint2 = joint1 exactly (1:1 coupling).
+    This prevents the legs from deforming asymmetrically during yaw correction
+    or from drifting apart due to physics asymmetry.
+    solimp/solref tuned to be stiff but not rigid (avoids constraint explosion).
+    =======================================================================-->
+    <equality>
+        <joint joint1="left_hip"   joint2="right_hip"  polycoef="0 1 0 0 0"
+               solimp="0.9 0.95 0.001" solref="0.02 1"/>
+        <joint joint1="left_knee"  joint2="right_knee" polycoef="0 1 0 0 0"
+               solimp="0.9 0.95 0.001" solref="0.02 1"/>
+    </equality>
+
 
     <!--=======================================================================
     ACTUATORS
